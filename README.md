@@ -73,8 +73,9 @@ result: OK, the sandbox holds its promises
 Canaries cover the startup files of zsh, bash and fish plus `~/.profile`,
 the persistence directories (systemd user units, desktop autostart), and
 two self-escape targets: Island's own profiles and claude-island's config
-(which holds the proxy allowlist). Two variants cover the other modes:
-`check --ro` (writing inside the project must be denied) and `check --proxy`
+(which holds the proxy allowlist). Variants cover the other modes and
+combine like the run flags: `check --ro` (project write must be denied),
+`check --noexec` (project execve must be denied) and `check --proxy`
 (direct 443 must be denied, a non-allowlisted domain must get 403, an
 allowlisted one must pass).
 
@@ -98,6 +99,7 @@ claude-island                       base sandbox
 claude-island --rust                unlock cargo and rustup (already installed)
 claude-island --rust --node --c     environments are stackable
 claude-island --ro                  project in READ-ONLY mode (code review)
+claude-island --noexec              deny running project files (combines with --ro)
 claude-island --proxy               network filtered by domain allowlist
 claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
 claude-island check                 canary suite: verify the sandbox holds
@@ -173,12 +175,21 @@ gitlab.example.com          # a domain also covers its subdomains
 Denials and grants are logged to `~/.cache/claude-island/proxy.log`: check
 it to see what Claude actually tried to reach, and refine the list.
 
-## Code review mode: `--ro`
+## Code review mode: `--ro` and `--noexec`
 
 For unknown repositories (unaudited code, possible prompt injection in the
-README). The project becomes read + execute only: Claude can read, search
-and run tools, but cannot modify the repository. Only its own state and the
-isolated TMPDIR stay writable. Verify with `claude-island check --ro`.
+README). `--ro` makes the project read + execute only: Claude can read,
+search and run tools, but cannot modify the repository. Only its own state
+and the isolated TMPDIR stay writable. Verify with `claude-island check --ro`.
+
+Execution of project files stays allowed under `--ro` because denying it
+buys little: interpreted files (`bash x.sh`, `python3 x.py`) only need read,
+native binaries can be launched through the loader
+(`/lib64/ld-linux-x86-64.so.2 ./x`), and whatever runs stays confined by the
+same sandbox anyway. If you want that speed bump against naive attacks
+regardless, add `--noexec`: it denies direct `execve` of project files and
+combines with `--ro` (project becomes read-only, no execution). Verify with
+`claude-island check --noexec` or `check --ro --noexec`.
 
 Note: an `--ro` profile declares no Island `[[context]]`, because Island
 grants full access beneath context paths (they are treated as workspaces).

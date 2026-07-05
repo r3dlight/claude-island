@@ -59,6 +59,7 @@ pub fn generate(
     project: &Path,
     envs: &[&EnvSpec],
     ro: bool,
+    noexec: bool,
     serve_ports: &[u16],
     connect_ports: &[u16],
     extra_env: &[(String, String)],
@@ -77,11 +78,13 @@ pub fn generate(
         )
     };
     let ro_tag = if ro { "-ro" } else { "" };
+    let noexec_tag = if noexec { "-noexec" } else { "" };
     let name = format!(
-        "claude-{}{}{}-{}",
+        "claude-{}{}{}{}-{}",
         slug(project),
         env_tag,
         ro_tag,
+        noexec_tag,
         hash8(&project.to_string_lossy())
     );
     let dir = home.join(".config/island/profiles").join(&name);
@@ -105,11 +108,14 @@ pub fn generate(
         ),
     )?;
 
-    // The project: rw + exec, or read-only + exec in review mode (--ro).
-    let access = if ro {
-        r#""abi.read_execute""#
-    } else {
-        r#""abi.read_write", "abi.read_execute""#
+    // The project: rw + exec by default; --ro drops write, --noexec drops
+    // execve of project files (a speed bump only: interpreters and the
+    // ld.so trick bypass it, see README), and they combine.
+    let access = match (ro, noexec) {
+        (false, false) => r#""abi.read_write", "abi.read_execute""#,
+        (true, false) => r#""abi.read_execute""#,
+        (false, true) => r#""abi.read_write""#,
+        (true, true) => r#""read_file", "read_dir""#,
     };
     fs::write(
         landlock.join("15-project.toml"),
@@ -133,13 +139,13 @@ pub fn generate(
         )?;
     }
 
-    // Island grants FULL filesystem access beneath every [[context]]
-    // when_beneath path (treated as a workspace, AccessFs::from_all in
-    // island's workspace.rs), which would override the read-only project
-    // rule by union. In --ro mode the profile therefore declares no
-    // context: it is only usable through explicit selection (-p), which is
-    // how the wrapper always launches it.
-    let mut p = if ro {
+    // Island grants FULL filesystem access (write AND execute) beneath
+    // every [[context]] when_beneath path (treated as a workspace,
+    // AccessFs::from_all in island's workspace.rs), which would override a
+    // restricted project rule by union. In --ro and --noexec modes the
+    // profile therefore declares no context: it is only usable through
+    // explicit selection (-p), which is how the wrapper always launches it.
+    let mut p = if ro || noexec {
         String::new()
     } else {
         format!(

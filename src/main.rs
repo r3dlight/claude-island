@@ -80,6 +80,8 @@ Options:
                    (stackable). Installs nothing: refuses if missing.
                    Aliases: --java/--kotlin/--scala -> jvm, --cpp -> c.
   --ro             project in READ-ONLY mode (code review)
+  --noexec         deny execve of project files (speed bump: interpreters
+                   and the ld.so trick bypass it); combines with --ro
   --proxy          network restricted to a domain-filtering proxy
                    (allowlist: base domains + environments + --allow +
                    ~/.config/claude-island/domains.allow)
@@ -97,6 +99,7 @@ Env: CLAUDE_ISLAND_MEM (default 8G), CLAUDE_ISLAND_TASKS (default 4096)
 struct Opts {
     env_names: Vec<String>,
     ro: bool,
+    noexec: bool,
     proxy: bool,
     serve: bool,
     ports: Vec<u16>,
@@ -130,6 +133,7 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
         let a = args[i].as_str();
         match a {
             "--ro" => o.ro = true,
+            "--noexec" => o.noexec = true,
             "--proxy" => o.proxy = true,
             "--serve" => o.serve = true,
             "--dry-run" => o.dry_run = true,
@@ -313,6 +317,7 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         &project,
         &sel,
         o.ro,
+        o.noexec,
         &serve_ports,
         &net.connect_ports,
         &net.extra_env,
@@ -373,29 +378,48 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         envs::prepare(e, &home);
     }
     let net = setup_network(&o, &sel, &home)?;
-    let prof = profile::generate(&home, &project, &sel, o.ro, &[], &net.connect_ports, &net.extra_env)
-        .map_err(|e| format!("profile generation: {e}"))?;
+    let prof = profile::generate(
+        &home,
+        &project,
+        &sel,
+        o.ro,
+        o.noexec,
+        &[],
+        &net.connect_ports,
+        &net.extra_env,
+    )
+    .map_err(|e| format!("profile generation: {e}"))?;
     if !envs::has_cmd("island") {
         return Err("island not found in PATH: run ./install.sh first".into());
     }
 
-    // The current binary is copied into the project (rw + exec inside the
-    // sandbox; the copy itself happens before sandboxing, so it also works
-    // for --ro) then re-run in canary mode.
+    // The current binary is copied into ~/.local/bin (read + exec in every
+    // profile, unlike the project which loses exec with --noexec) then
+    // re-run in canary mode. Both copies happen before sandboxing.
     let exe = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let target = project.join(".claude-island-canary");
+    let bin_dir = home.join(".local/bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
+    let target = bin_dir.join(".claude-island-canary");
     std::fs::copy(&exe, &target).map_err(|e| format!("canary copy: {e}"))?;
+    // Execution probe inside the project, for the exec canaries.
+    let probe = project.join(".claude-island-canary-exec");
+    std::fs::copy("/usr/bin/true", &probe).map_err(|e| format!("exec probe copy: {e}"))?;
+
     eprintln!("claude-island: canaries inside sandbox \"{}\"", prof.name);
     let mut cmd = Command::new("island");
     cmd.args(["run", "-p", &prof.name, "--"]).arg(&target).arg("__canary");
     if o.ro {
         cmd.arg("--ro");
     }
+    if o.noexec {
+        cmd.arg("--noexec");
+    }
     if o.proxy {
         cmd.arg("--proxy");
     }
     let status = cmd.status();
     let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&probe);
     let status = status.map_err(|e| format!("failed to run island: {e}"))?;
     Ok(exit_code(status))
 }
@@ -464,10 +488,14 @@ fn cmd_update() -> Result<ExitCode> {
 
 fn dispatch(args: &[String]) -> Result<ExitCode> {
     match args.first().map(String::as_str) {
-        Some("__canary") => Ok(canary::run_all(
-            args[1..].iter().any(|a| a == "--ro"),
-            args[1..].iter().any(|a| a == "--proxy"),
-        )),
+        Some("__canary") => {
+            let rest = &args[1..];
+            Ok(canary::run_all(canary::Modes {
+                ro: rest.iter().any(|a| a == "--ro"),
+                noexec: rest.iter().any(|a| a == "--noexec"),
+                proxy: rest.iter().any(|a| a == "--proxy"),
+            }))
+        }
         Some("__proxy") => proxy::standalone(&args[1..]),
         Some("update") => cmd_update(),
         Some("check") => {

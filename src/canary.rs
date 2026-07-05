@@ -80,7 +80,14 @@ fn proxy_request(port: u16, target: &str) -> std::io::Result<u16> {
         .ok_or_else(|| std::io::Error::other(format!("unparsable proxy response: {line}")))
 }
 
-pub fn run_all(ro: bool, proxy: bool) -> ExitCode {
+/// Sandbox modes under test, mirroring the wrapper flags.
+pub struct Modes {
+    pub ro: bool,
+    pub noexec: bool,
+    pub proxy: bool,
+}
+
+pub fn run_all(m: Modes) -> ExitCode {
     let home = PathBuf::from(env::var("HOME").unwrap_or_default());
     let project = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut fails = 0u32;
@@ -175,8 +182,33 @@ pub fn run_all(ro: bool, proxy: bool) -> ExitCode {
         },
     );
 
+    // Project execution probe (a copy of /usr/bin/true placed by cmd_check
+    // before sandboxing): denied in --noexec mode, required otherwise.
+    let probe = project.join(".claude-island-canary-exec");
+    if m.noexec {
+        record(
+            "deny (--noexec): execute a file inside the project",
+            match Command::new(&probe).status() {
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) if e.kind() == ErrorKind::NotFound => Skip("probe absent".into()),
+                Err(e) => Skip(format!("unexpected error: {e}")),
+                Ok(_) => Fail("execution GRANTED in a noexec project".into()),
+            },
+        );
+    } else {
+        record(
+            "allow: execute a file inside the project",
+            match Command::new(&probe).status() {
+                Ok(s) if s.success() => Pass,
+                Ok(_) => Fail("probe exited with a non-zero code".into()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Skip("probe absent".into()),
+                Err(e) => Fail(format!("denied where it should work: {e}")),
+            },
+        );
+    }
+
     // Project write: denied in --ro mode, required otherwise.
-    if ro {
+    if m.ro {
         record("deny (--ro): write inside the project", {
             let p = project.join(".claude-island-canary-write");
             match File::create(&p) {
@@ -225,7 +257,7 @@ pub fn run_all(ro: bool, proxy: bool) -> ExitCode {
             Err(_) => Skip("TMPDIR not set".into()),
         }
     });
-    if proxy {
+    if m.proxy {
         // In --proxy mode, the ONLY outbound TCP is the proxy port, and the
         // proxy itself enforces the domain allowlist.
         record(
