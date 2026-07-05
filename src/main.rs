@@ -10,6 +10,7 @@
 
 mod canary;
 mod envs;
+mod explain;
 mod profile;
 mod proxy;
 
@@ -73,6 +74,8 @@ Usage:
                                        verify the sandbox (canary suite)
   claude-island update                 update Island (pinned revision),
                                        rebuild claude-island, re-run checks
+  claude-island explain [OPTIONS]      show what the profile would grant,
+                                       without writing or running anything
   claude-island --list                 list available environments
 
 Options:
@@ -196,7 +199,10 @@ fn guards() -> Result<(PathBuf, PathBuf)> {
         return Err("refusing to sandbox $HOME itself, run from a project directory".into());
     }
     if !project.starts_with(&home) {
-        return Err(format!("the project must live under $HOME ({})", project.display()));
+        return Err(format!(
+            "the project must live under $HOME ({})",
+            project.display()
+        ));
     }
     Ok((home, project))
 }
@@ -338,7 +344,11 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         argv.push("-p".into());
         argv.push(format!("TasksMax={tasks}"));
     }
-    argv.extend(["island", "run", "-p", &prof.name, "--", "claude"].iter().map(|s| s.to_string()));
+    argv.extend(
+        ["island", "run", "-p", &prof.name, "--", "claude"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
     argv.extend(o.rest.iter().cloned());
 
     if o.dry_run {
@@ -398,7 +408,8 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     // re-run in canary mode. Both copies happen before sandboxing.
     let exe = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let bin_dir = home.join(".local/bin");
-    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
     let target = bin_dir.join(".claude-island-canary");
     std::fs::copy(&exe, &target).map_err(|e| format!("canary copy: {e}"))?;
     // Execution probe inside the project, for the exec canaries.
@@ -407,7 +418,9 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
     eprintln!("claude-island: canaries inside sandbox \"{}\"", prof.name);
     let mut cmd = Command::new("island");
-    cmd.args(["run", "-p", &prof.name, "--"]).arg(&target).arg("__canary");
+    cmd.args(["run", "-p", &prof.name, "--"])
+        .arg(&target)
+        .arg("__canary");
     if o.ro {
         cmd.arg("--ro");
     }
@@ -422,6 +435,126 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let _ = std::fs::remove_file(&probe);
     let status = status.map_err(|e| format!("failed to run island: {e}"))?;
     Ok(exit_code(status))
+}
+
+/// `explain`: a human-readable summary of what the profile would grant,
+/// computed from the same inputs as run/check but with no side effect
+/// (nothing written, no proxy started, no toolchain check).
+fn cmd_explain(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
+    let (home, project) = guards()?;
+    let sel = selected(registry, &o.env_names)?;
+    let home_str = home.to_string_lossy().to_string();
+    let project_str = project.to_string_lossy().to_string();
+    let display = |p: &str| -> String {
+        let p = p
+            .replace("${home}", &home_str)
+            .replace("${project}", &project_str);
+        match p.strip_prefix(&home_str) {
+            Some(rest) if !rest.is_empty() => format!("~{rest}"),
+            _ => p,
+        }
+    };
+
+    println!(
+        "profile: {}",
+        profile::name_for(&project, &sel, o.ro, o.noexec)
+    );
+    let mode = match (o.ro, o.noexec) {
+        (false, false) => "rw + exec",
+        (true, false) => "read + exec (--ro)",
+        (false, true) => "rw, no exec (--noexec)",
+        (true, true) => "read-only (--ro --noexec)",
+    };
+    println!("project: {} [{mode}]", project.display());
+
+    // Filesystem: rules from the embedded snippets plus the generated
+    // project rule, grouped by access level.
+    let mut groups: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    let mut texts: Vec<&str> = vec![profile::BASE, profile::CLAUDE];
+    for e in &sel {
+        texts.push(&e.snippet);
+    }
+    for text in texts {
+        for rule in explain::path_rules(text) {
+            let label = explain::label(&rule.access);
+            for parent in &rule.parents {
+                groups.entry(label).or_default().push(display(parent));
+            }
+        }
+    }
+    let project_label = match (o.ro, o.noexec) {
+        (false, false) => "rw + exec",
+        (true, false) => "read + exec",
+        (false, true) => "rw",
+        (true, true) => "read-only",
+    };
+    groups
+        .entry(project_label)
+        .or_default()
+        .insert(0, "<project>".into());
+
+    println!("\nfilesystem (everything not listed is denied)");
+    for label in explain::LABELS {
+        if let Some(paths) = groups.get(label) {
+            println!("  {label:<11} {}", paths.join(", "));
+        }
+    }
+
+    println!("\nnetwork");
+    if o.proxy {
+        let domains = proxy_domains(&sel, &o.allow, &home);
+        println!("  outbound     only the filtering proxy on 127.0.0.1 (ephemeral port)");
+        println!(
+            "  allowlist    {} domains: {}",
+            domains.len(),
+            domains.join(", ")
+        );
+    } else {
+        println!("  outbound     TCP 443, 80, 53 to ANY host (UDP is not restricted)");
+    }
+    let mut serve_ports: Vec<u16> = vec![];
+    if o.serve {
+        serve_ports.extend_from_slice(DEV_SERVE_PORTS);
+    }
+    serve_ports.extend(&o.ports);
+    if serve_ports.is_empty() {
+        println!("  listening    denied");
+    } else {
+        let ports: Vec<String> = serve_ports.iter().map(|p| p.to_string()).collect();
+        println!("  listening    TCP {}", ports.join(", "));
+    }
+
+    println!("\nworkspaces (isolated per profile, full access inside)");
+    println!("  XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME,");
+    println!("  XDG_RUNTIME_DIR, TMPDIR");
+    if !o.ro && !o.noexec {
+        println!("  note: Island also grants full access beneath the project (context path)");
+    }
+
+    println!("\nenvironment");
+    let mut injected = vec![
+        format!(
+            "CLAUDE_CONFIG_DIR={}",
+            display(&home.join(".claude").to_string_lossy())
+        ),
+        "DISABLE_AUTOUPDATER=1".to_string(),
+    ];
+    if o.proxy {
+        injected.push("HTTP(S)_PROXY -> the filtering proxy".to_string());
+    }
+    println!("  injected     {}", injected.join(", "));
+    println!("  scrubbed     {}", SCRUB_ENV.join(", "));
+    println!(
+        "               plus any *{} (kept: {})",
+        SCRUB_SUFFIXES.join(", *"),
+        KEEP_ENV.join(", ")
+    );
+
+    let mem = env::var("CLAUDE_ISLAND_MEM").unwrap_or_else(|_| "8G".into());
+    let tasks = env::var("CLAUDE_ISLAND_TASKS").unwrap_or_else(|_| "4096".into());
+    println!("\nlimits (systemd-run)");
+    println!("  MemoryMax={mem}, TasksMax={tasks}");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Runs a command and turns a failure into an error message.
@@ -447,9 +580,15 @@ fn cmd_update() -> Result<ExitCode> {
     run_step(
         &format!("installing Island at pinned revision {}", &ISLAND_REV[..12]),
         "cargo",
-        &["install", "--locked", "--force", "--git", ISLAND_GIT, "--rev", ISLAND_REV, "island"],
+        &[
+            "install", "--locked", "--force", "--git", ISLAND_GIT, "--rev", ISLAND_REV, "island",
+        ],
     )?;
-    run_step("refreshing Island profile defaults", "island", &["update", "--all"])?;
+    run_step(
+        "refreshing Island profile defaults",
+        "island",
+        &["update", "--all"],
+    )?;
 
     // Rebuild this binary if its sources are still where it was built from.
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -473,7 +612,10 @@ fn cmd_update() -> Result<ExitCode> {
                 .status()
                 .map_err(|e| format!("failed to re-run {}: {e}", args.join(" ")))?;
             if !status.success() {
-                return Err(format!("validation failed: claude-island {}", args.join(" ")));
+                return Err(format!(
+                    "validation failed: claude-island {}",
+                    args.join(" ")
+                ));
             }
         }
         eprintln!("claude-island: update complete, sandbox validated");
@@ -498,6 +640,20 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         }
         Some("__proxy") => proxy::standalone(&args[1..]),
         Some("update") => cmd_update(),
+        Some("explain") => {
+            let registry = envs::registry();
+            match parse(&args[1..], &registry)? {
+                Parsed::Go(o) => cmd_explain(o, &registry),
+                Parsed::Help => {
+                    print!("{HELP}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                Parsed::List => {
+                    print_list(&registry);
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
         Some("check") => {
             let registry = envs::registry();
             match parse(&args[1..], &registry)? {

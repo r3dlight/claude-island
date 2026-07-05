@@ -106,6 +106,7 @@ claude-island check                 canary suite: verify the sandbox holds
 claude-island check --ro            same, read-only variant
 claude-island check --proxy         same, domain-filtering variant
 claude-island update                update Island (pinned), rebuild, re-check
+claude-island explain --rust --ro   show what the profile would grant (no side effect)
 claude-island --list                list available environments
 claude-island --serve               allow TCP bind on 3000, 4321, 5173, 8000, 8080
 claude-island --ports 9000,9443     additional bind ports
@@ -205,8 +206,26 @@ auto-activation hook simply never picks up an `--ro` profile.
   outside.
 * Tools that hardcode `/tmp` fail: `TMPDIR` points to an isolated,
   per-profile workspace.
-* On an unexpected denial: `claude-island --dry-run` shows the generated
-  profile, `island -v run -p <profile> -- <cmd>` gives verbose detail.
+* `claude-island explain [flags]` prints a readable summary of what the
+  profile would grant (filesystem by access level, network, allowlist,
+  scrubbed variables, limits) without writing or running anything:
+
+  ```
+  $ claude-island explain --rust --ro --proxy
+  project: ~/dev/unknown-tool [read + exec (--ro)]
+  filesystem (everything not listed is denied)
+    rw + exec   ~/.cargo, ~/.rustup
+    rw          ~/.claude, ~/.cache/claude, /dev/null, ...
+    read + exec <project>, /bin, /usr, ...
+    read-only   /etc, /proc, /sys, ~/.gitconfig
+  network
+    outbound     only the filtering proxy on 127.0.0.1
+    allowlist    10 domains: api.anthropic.com, crates.io, github.com, ...
+  ...
+  ```
+
+* On an unexpected denial: `claude-island explain` first, then
+  `island -v run -p <profile> -- <cmd>` for verbose detail.
 * Island is young ("work in progress, so be careful"), so it is installed
   at a revision pinned in `src/main.rs` and validated by the canaries.
   `claude-island update` is the one safe way to move: it reinstalls Island

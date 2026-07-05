@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::envs::EnvSpec;
 
-const BASE: &str = include_str!("../snippets/00-base.toml");
-const CLAUDE: &str = include_str!("../snippets/10-claude.toml");
+pub const BASE: &str = include_str!("../snippets/00-base.toml");
+pub const CLAUDE: &str = include_str!("../snippets/10-claude.toml");
 
 /// Common header: every handled access is denied by default in each file.
 const HEADER: &str = "abi = 6\n\n[[ruleset]]\nhandled_access_fs = [\"abi.all\"]\nhandled_access_net = [\"abi.all\"]\nscoped = [\"abi.all\"]\n";
@@ -54,6 +54,31 @@ fn toml_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The profile name for a given (project, environments, modes) tuple.
+pub fn name_for(project: &Path, envs: &[&EnvSpec], ro: bool, noexec: bool) -> String {
+    let env_tag = if envs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "-{}",
+            envs.iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join("-")
+        )
+    };
+    let ro_tag = if ro { "-ro" } else { "" };
+    let noexec_tag = if noexec { "-noexec" } else { "" };
+    format!(
+        "claude-{}{}{}{}-{}",
+        slug(project),
+        env_tag,
+        ro_tag,
+        noexec_tag,
+        hash8(&project.to_string_lossy())
+    )
+}
+
 pub fn generate(
     home: &Path,
     project: &Path,
@@ -69,24 +94,7 @@ pub fn generate(
         fs::create_dir_all(home.join(d))?;
     }
 
-    let env_tag = if envs.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "-{}",
-            envs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join("-")
-        )
-    };
-    let ro_tag = if ro { "-ro" } else { "" };
-    let noexec_tag = if noexec { "-noexec" } else { "" };
-    let name = format!(
-        "claude-{}{}{}{}-{}",
-        slug(project),
-        env_tag,
-        ro_tag,
-        noexec_tag,
-        hash8(&project.to_string_lossy())
-    );
+    let name = name_for(project, envs, ro, noexec);
     let dir = home.join(".config/island/profiles").join(&name);
     let _ = fs::remove_dir_all(&dir);
     let landlock = dir.join("landlock");
@@ -155,7 +163,10 @@ pub fn generate(
     };
     let claude_config = home.join(".claude");
     let mut env_entries: Vec<(String, String)> = vec![
-        ("CLAUDE_CONFIG_DIR".into(), claude_config.to_string_lossy().into_owned()),
+        (
+            "CLAUDE_CONFIG_DIR".into(),
+            claude_config.to_string_lossy().into_owned(),
+        ),
         ("DISABLE_AUTOUPDATER".into(), "1".into()),
     ];
     env_entries.extend(extra_env.iter().cloned());

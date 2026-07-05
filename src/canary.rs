@@ -41,9 +41,9 @@ fn expect_allowed(res: std::io::Result<()>) -> Verdict {
 }
 
 fn connect(addr: &str) -> std::io::Result<()> {
-    let sa: SocketAddr = addr
-        .parse()
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, format!("bad address {addr}: {e}")))?;
+    let sa: SocketAddr = addr.parse().map_err(|e| {
+        std::io::Error::new(ErrorKind::InvalidInput, format!("bad address {addr}: {e}"))
+    })?;
     TcpStream::connect_timeout(&sa, Duration::from_millis(500)).map(|_| ())
 }
 
@@ -58,9 +58,9 @@ fn proxy_port() -> Option<u16> {
 /// the first response line (e.g. 200, 403, 502).
 fn proxy_request(port: u16, target: &str) -> std::io::Result<u16> {
     use std::io::{Read, Write};
-    let sa: SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, format!("bad proxy address: {e}")))?;
+    let sa: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|e| {
+        std::io::Error::new(ErrorKind::InvalidInput, format!("bad proxy address: {e}"))
+    })?;
     let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())?;
@@ -108,9 +108,18 @@ pub fn run_all(m: Modes) -> ExitCode {
     }
 
     // Accesses that MUST be denied.
-    record("deny: list $HOME", expect_denied(fs::read_dir(&home).map(|_| ())));
-    record("deny: read ~/.ssh", expect_denied(fs::read_dir(home.join(".ssh")).map(|_| ())));
-    record("deny: read ~/.aws", expect_denied(fs::read_dir(home.join(".aws")).map(|_| ())));
+    record(
+        "deny: list $HOME",
+        expect_denied(fs::read_dir(&home).map(|_| ())),
+    );
+    record(
+        "deny: read ~/.ssh",
+        expect_denied(fs::read_dir(home.join(".ssh")).map(|_| ())),
+    );
+    record(
+        "deny: read ~/.aws",
+        expect_denied(fs::read_dir(home.join(".aws")).map(|_| ())),
+    );
     record(
         "deny: read ~/.config/gh",
         expect_denied(fs::read_dir(home.join(".config/gh")).map(|_| ())),
@@ -129,7 +138,12 @@ pub fn run_all(m: Modes) -> ExitCode {
     ] {
         record(
             &format!("deny: write ~/{rc}"),
-            expect_denied(OpenOptions::new().append(true).open(home.join(rc)).map(|_| ())),
+            expect_denied(
+                OpenOptions::new()
+                    .append(true)
+                    .open(home.join(rc))
+                    .map(|_| ()),
+            ),
         );
     }
     // Persistence and self-escape directories: systemd user units, desktop

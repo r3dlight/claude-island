@@ -121,8 +121,20 @@ pub fn registry() -> Vec<EnvSpec> {
             include_str!("../snippets/env-jvm.toml"),
             &["java"],
             &[],
-            &[".m2", ".gradle", ".ivy2", ".sbt", ".cache/coursier", ".sdkman"],
-            &["repo1.maven.org", "repo.maven.apache.org", "plugins.gradle.org", "services.gradle.org"],
+            &[
+                ".m2",
+                ".gradle",
+                ".ivy2",
+                ".sbt",
+                ".cache/coursier",
+                ".sdkman",
+            ],
+            &[
+                "repo1.maven.org",
+                "repo.maven.apache.org",
+                "plugins.gradle.org",
+                "services.gradle.org",
+            ],
         ),
         spec(
             "ruby",
@@ -204,11 +216,15 @@ pub fn registry() -> Vec<EnvSpec> {
         if let Ok(entries) = fs::read_dir(&user_dir) {
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().to_string();
-                let Some(name) = fname.strip_prefix("env-").and_then(|s| s.strip_suffix(".toml"))
+                let Some(name) = fname
+                    .strip_prefix("env-")
+                    .and_then(|s| s.strip_suffix(".toml"))
                 else {
                     continue;
                 };
-                let Ok(content) = fs::read_to_string(entry.path()) else { continue };
+                let Ok(content) = fs::read_to_string(entry.path()) else {
+                    continue;
+                };
                 if let Some(e) = reg.iter_mut().find(|e| e.name == name) {
                     e.snippet = content;
                 } else {
@@ -229,7 +245,9 @@ pub fn resolve(registry: &[EnvSpec], name: &str) -> Option<String> {
 }
 
 pub fn has_cmd(name: &str) -> bool {
-    let Ok(path) = env::var("PATH") else { return false };
+    let Ok(path) = env::var("PATH") else {
+        return false;
+    };
     path.split(':').any(|dir| {
         let p = Path::new(dir).join(name);
         p.is_file()

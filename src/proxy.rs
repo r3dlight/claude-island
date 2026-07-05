@@ -38,11 +38,20 @@ pub fn start(domains: Vec<String>, log_path: &Path) -> io::Result<Proxy> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new().create(true).append(true).open(log_path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
     let log: Log = Arc::new(Mutex::new(Box::new(file)));
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
-    log_line(&log, &format!("starting on 127.0.0.1:{port}, allowlist: {}", domains.join(" ")));
+    log_line(
+        &log,
+        &format!(
+            "starting on 127.0.0.1:{port}, allowlist: {}",
+            domains.join(" ")
+        ),
+    );
     spawn_accept_loop(listener, Arc::new(domains), log);
     Ok(Proxy { port })
 }
@@ -158,8 +167,7 @@ fn tunnel(client: TcpStream, server: TcpStream) {
 /// chosen port then serves forever (logs to stderr).
 pub fn standalone(domains: &[String]) -> Result<std::process::ExitCode, String> {
     let log: Log = Arc::new(Mutex::new(Box::new(io::stderr())));
-    let listener =
-        TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("proxy bind: {e}"))?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("proxy bind: {e}"))?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("proxy local address: {e}"))?
