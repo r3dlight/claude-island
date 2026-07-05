@@ -75,14 +75,45 @@ pub fn run_all(ro: bool) -> ExitCode {
         "deny: read ~/.config/gh",
         expect_denied(fs::read_dir(home.join(".config/gh")).map(|_| ())),
     );
-    record(
-        "deny: write ~/.zshrc",
-        expect_denied(OpenOptions::new().append(true).open(home.join(".zshrc")).map(|_| ())),
-    );
-    record(
-        "deny: write ~/.bashrc",
-        expect_denied(OpenOptions::new().append(true).open(home.join(".bashrc")).map(|_| ())),
-    );
+    // Shell startup files (persistence vector), across shells. Absent files
+    // are reported as SKIP; creating them is covered by the $HOME-root and
+    // ~/.config canaries below.
+    for rc in [
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+        ".config/fish/config.fish",
+    ] {
+        record(
+            &format!("deny: write ~/{rc}"),
+            expect_denied(OpenOptions::new().append(true).open(home.join(rc)).map(|_| ())),
+        );
+    }
+    // Persistence and self-escape directories: systemd user units, desktop
+    // autostart, Island's own profiles, claude-island's config (which holds
+    // the proxy allowlist).
+    for dir in [
+        ".config/systemd/user",
+        ".config/autostart",
+        ".config/island/profiles",
+        ".config/claude-island",
+    ] {
+        record(&format!("deny: create a file in ~/{dir}"), {
+            let p = home.join(dir).join("claude-island-canary-forbidden");
+            match File::create(&p) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&p);
+                    Fail(format!("creation GRANTED in ~/{dir}"))
+                }
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) if e.kind() == ErrorKind::NotFound => Skip("directory absent".into()),
+                Err(e) => Skip(format!("unexpected error: {e}")),
+            }
+        });
+    }
     record("deny: create a file at the root of $HOME", {
         let p = home.join(".claude-island-canary-forbidden");
         match File::create(&p) {

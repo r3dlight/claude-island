@@ -60,12 +60,18 @@ $ claude-island check
 [PASS] deny: list $HOME
 [PASS] deny: read ~/.ssh
 [PASS] deny: write ~/.zshrc
+[PASS] deny: create a file in ~/.config/systemd/user
 [PASS] deny: TCP bind on a non-allowed port (34567)
 [PASS] allow: write inside the project
 [PASS] allow: execute /usr/bin/true
 ...
 result: OK, the sandbox holds its promises
 ```
+
+Canaries cover the startup files of zsh, bash and fish plus `~/.profile`,
+the persistence directories (systemd user units, desktop autostart), and
+two self-escape targets: Island's own profiles and claude-island's config
+(which holds the proxy allowlist).
 
 ## Install
 
