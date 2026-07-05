@@ -9,7 +9,7 @@ sandbox. Claude can work on the current project and nothing else: your SSH
 keys, tokens, dotfiles and other projects are invisible, and the network can
 be reduced to an allowlist of domains. Built on
 [Island](https://github.com/landlock-lsm/island) and
-[Landlock](https://landlock.io) by Mickaël Salaün. Deny by default.
+[Landlock](https://landlock.io).
 
 ## Quickstart
 
