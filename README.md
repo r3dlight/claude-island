@@ -48,10 +48,12 @@ Claude and every process it spawns get:
 | Local services | | D-Bus, Wayland and ssh-agent sockets, abstract sockets, signals to the outside |
 | Resources | 8G RAM, 4096 tasks (systemd limits) | fork bombs, runaway builds |
 
-Secrets are also scrubbed from the environment before launch
-(`SSH_AUTH_SOCK`, `AWS_*`, `GITHUB_TOKEN`, npm/cargo tokens, ...).
-Enforcement is done by the kernel (Landlock): restrictions are inherited by
-all child processes and cannot be lifted once applied.
+Secrets are also scrubbed from the environment before launch: a fixed list
+(`SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `AWS_*`, ...) plus every
+variable ending in `_TOKEN`, `_SECRET`, `_KEY`, `_PASSWORD`, `_PASSWD` or
+`_CREDENTIALS` (`ANTHROPIC_API_KEY` is kept). Enforcement is done by the
+kernel (Landlock): restrictions are inherited by all child processes and
+cannot be lifted once applied.
 
 Don't trust it, verify:
 
@@ -71,7 +73,10 @@ result: OK, the sandbox holds its promises
 Canaries cover the startup files of zsh, bash and fish plus `~/.profile`,
 the persistence directories (systemd user units, desktop autostart), and
 two self-escape targets: Island's own profiles and claude-island's config
-(which holds the proxy allowlist).
+(which holds the proxy allowlist). Two variants cover the other modes:
+`check --ro` (writing inside the project must be denied) and `check --proxy`
+(direct 443 must be denied, a non-allowlisted domain must get 403, an
+allowlisted one must pass).
 
 ## Install
 
@@ -97,6 +102,8 @@ claude-island --proxy               network filtered by domain allowlist
 claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
 claude-island check                 canary suite: verify the sandbox holds
 claude-island check --ro            same, read-only variant
+claude-island check --proxy         same, domain-filtering variant
+claude-island update                update Island (pinned), rebuild, re-check
 claude-island --list                list available environments
 claude-island --serve               allow TCP bind on 3000, 4321, 5173, 8000, 8080
 claude-island --ports 9000,9443     additional bind ports
@@ -189,8 +196,11 @@ auto-activation hook simply never picks up an `--ro` profile.
   per-profile workspace.
 * On an unexpected denial: `claude-island --dry-run` shows the generated
   profile, `island -v run -p <profile> -- <cmd>` gives verbose detail.
-* Re-run `claude-island check` after every update of Island, claude-island
-  or the kernel. Island itself is young ("work in progress, so be careful").
+* Island is young ("work in progress, so be careful"), so it is installed
+  at a revision pinned in `src/main.rs` and validated by the canaries.
+  `claude-island update` is the one safe way to move: it reinstalls Island
+  at the pin, rebuilds claude-island, refreshes profile defaults and re-runs
+  `check` and `check --ro`. Also re-run the checks after a kernel update.
 * Optional zsh integration, to auto-sandbox every command in profiled
   directories: `source <(island hook zsh)` in `~/.zshrc`. The claude-island
   binary itself works from any shell.

@@ -47,7 +47,40 @@ fn connect(addr: &str) -> std::io::Result<()> {
     TcpStream::connect_timeout(&sa, Duration::from_millis(500)).map(|_| ())
 }
 
-pub fn run_all(ro: bool) -> ExitCode {
+/// The proxy port inside the sandbox, parsed from HTTPS_PROXY
+/// (http://127.0.0.1:PORT), injected by the wrapper in --proxy mode.
+fn proxy_port() -> Option<u16> {
+    let v = env::var("HTTPS_PROXY").ok()?;
+    v.rsplit_once(':')?.1.trim_end_matches('/').parse().ok()
+}
+
+/// Sends a CONNECT request through the proxy and returns the status code of
+/// the first response line (e.g. 200, 403, 502).
+fn proxy_request(port: u16, target: &str) -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+    let sa: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, format!("bad proxy address: {e}")))?;
+    let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(2))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())?;
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    while n < buf.len() && !buf[..n].windows(2).any(|w| w == b"\r\n") {
+        match s.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) => return Err(e),
+        }
+    }
+    let line = String::from_utf8_lossy(&buf[..n]);
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| std::io::Error::other(format!("unparsable proxy response: {line}")))
+}
+
+pub fn run_all(ro: bool, proxy: bool) -> ExitCode {
     let home = PathBuf::from(env::var("HOME").unwrap_or_default());
     let project = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut fails = 0u32;
@@ -192,15 +225,59 @@ pub fn run_all(ro: bool) -> ExitCode {
             Err(_) => Skip("TMPDIR not set".into()),
         }
     });
-    record(
-        "allow: TCP connect to port 443 (not blocked by Landlock)",
-        match connect("127.0.0.1:443") {
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                Fail("port 443 is denied".into())
+    if proxy {
+        // In --proxy mode, the ONLY outbound TCP is the proxy port, and the
+        // proxy itself enforces the domain allowlist.
+        record(
+            "deny (--proxy): direct TCP connect to port 443",
+            match connect("127.0.0.1:443") {
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) => Fail(format!("direct 443 not blocked by Landlock ({e})")),
+                Ok(()) => Fail("direct 443 connect GRANTED".into()),
+            },
+        );
+        match proxy_port() {
+            None => record(
+                "allow (--proxy): reach the filtering proxy",
+                Skip("HTTPS_PROXY not set or unparsable".into()),
+            ),
+            Some(port) => {
+                record(
+                    "allow (--proxy): reach the filtering proxy",
+                    expect_allowed(connect(&format!("127.0.0.1:{port}"))),
+                );
+                record(
+                    "deny (--proxy): CONNECT to a non-allowlisted domain",
+                    match proxy_request(port, "claude-island-canary-denied.example:443") {
+                        Ok(403) => Pass,
+                        Ok(code) => Fail(format!("proxy answered {code} instead of 403")),
+                        Err(e) => Skip(format!("proxy unreachable: {e}")),
+                    },
+                );
+                record(
+                    "allow (--proxy): CONNECT to an allowlisted domain (api.anthropic.com)",
+                    match proxy_request(port, "api.anthropic.com:443") {
+                        // 200 = tunnel established; 502 = allowlisted but no
+                        // network right now: both prove the allowlist logic.
+                        Ok(200) | Ok(502) => Pass,
+                        Ok(403) => Fail("allowlisted domain refused by the proxy".into()),
+                        Ok(code) => Skip(format!("unexpected proxy answer: {code}")),
+                        Err(e) => Skip(format!("proxy unreachable: {e}")),
+                    },
+                );
             }
-            _ => Pass, // connection refused or timeout = Landlock let it through
-        },
-    );
+        }
+    } else {
+        record(
+            "allow: TCP connect to port 443 (not blocked by Landlock)",
+            match connect("127.0.0.1:443") {
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    Fail("port 443 is denied".into())
+                }
+                _ => Pass, // connection refused or timeout = Landlock let it through
+            },
+        );
+    }
 
     if fails > 0 {
         println!("result: FAILURE ({fails} canary(ies) failed)");

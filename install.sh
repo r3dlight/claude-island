@@ -6,10 +6,17 @@ set -euo pipefail
 
 here="$(dirname "$(readlink -f "$0")")"
 
-# 1. Island (requires Rust >= 1.89)
+# 1. Island, at the revision pinned in src/main.rs (single source of truth).
+#    Island is a young project: only `claude-island update` moves this pin,
+#    and it re-runs the canary suite right after.
+ISLAND_REV="$(grep -oE 'ISLAND_REV: &str = "[0-9a-f]{40}' "$here/src/main.rs" | grep -oE '[0-9a-f]{40}')"
+if [[ -z "$ISLAND_REV" ]]; then
+    echo "error: pinned Island revision not found in src/main.rs" >&2
+    exit 1
+fi
 if ! command -v island >/dev/null; then
-    echo "== Installing Island from github.com/landlock-lsm/island =="
-    cargo install --locked --git https://github.com/landlock-lsm/island
+    echo "== Installing Island at pinned revision ${ISLAND_REV:0:12} =="
+    cargo install --locked --git https://github.com/landlock-lsm/island --rev "$ISLAND_REV" island
 fi
 
 # 2. claude-island
