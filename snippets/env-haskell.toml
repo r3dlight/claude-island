@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Haskell environment: ghcup (toolchains, execute-only: installation happens
+# outside the sandbox), cabal and stack (stores containing binaries).
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_execute"]
+parent = [
+    "${home}/.ghcup",
+]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.cabal",
+    "${home}/.stack",
+]

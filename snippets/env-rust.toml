@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Rust environment: cargo + rustup.
+# read_execute is required (toolchain binaries, proc-macros, rustc);
+# read_write for the registry, caches and `rustup component add`.
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.cargo",
+    "${home}/.rustup",
+]

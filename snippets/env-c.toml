@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# C/C++ environment (flags --c, --cpp).
+# gcc/clang/make/cmake live under /usr, already covered by the baseline:
+# this snippet only opens caches. Conan packages may embed tools executed
+# at build time, hence exec on ~/.conan2.
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write"]
+parent = [
+    "${home}/.cache/ccache",
+    "${home}/.ccache",
+]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.conan2",
+]

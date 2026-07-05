@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# JVM environment: Java, Kotlin, Scala (flags --java, --kotlin, --scala).
+# sdkman JDKs are execute-only: `sdk install` happens outside the sandbox.
+# Gradle downloads wrappers and JDKs into ~/.gradle: rw + exec required.
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_execute"]
+parent = [
+    "${home}/.sdkman",
+]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.gradle",
+]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write"]
+parent = [
+    "${home}/.m2",
+    "${home}/.ivy2",
+    "${home}/.sbt",
+    "${home}/.cache/coursier",
+]

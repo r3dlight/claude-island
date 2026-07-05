@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Python environment: pip/uv caches.
+# Philosophy: venvs live INSIDE the project (already rw+exec via ${project}).
+# No `pip install --user` (~/.local/lib stays denied, by design).
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write"]
+parent = [
+    "${home}/.cache/pip",
+    "${home}/.cache/uv",
+]
+
+# uv installs its managed pythons here: execution required.
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.local/share/uv",
+]

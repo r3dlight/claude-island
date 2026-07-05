@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "claude-island"
+version = "0.1.0"
+edition = "2021"
+description = "Sandbox Landlock/Island pour Claude Code"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true

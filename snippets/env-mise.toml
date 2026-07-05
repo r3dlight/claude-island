@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# mise (ex-rtx) manager: covers every language it manages in one go.
+# mise provisions outside the sandbox; here we only open access to the
+# installed toolchains and caches.
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.local/share/mise",
+]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write"]
+parent = [
+    "${home}/.cache/mise",
+]
+
+[[path_beneath]]
+allowed_access = ["read_dir", "read_file"]
+parent = [
+    "${home}/.config/mise",
+]

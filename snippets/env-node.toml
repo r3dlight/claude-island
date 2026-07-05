@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Node.js environment: npm/yarn/pnpm caches.
+# node_modules lives in the project (already rw+exec via ${project}).
+
+abi = 6
+
+[[ruleset]]
+handled_access_fs = ["abi.all"]
+handled_access_net = ["abi.all"]
+scoped = ["abi.all"]
+
+[[path_beneath]]
+allowed_access = ["abi.read_write"]
+parent = [
+    "${home}/.npm",
+    "${home}/.cache/yarn",
+]
+
+# The pnpm store contains binaries hard-linked into node_modules.
+[[path_beneath]]
+allowed_access = ["abi.read_write", "abi.read_execute"]
+parent = [
+    "${home}/.local/share/pnpm",
+]
+
+# nvm-managed node toolchains: execute only. `nvm install` happens outside
+# the sandbox, and `npm install -g` is deliberately denied (it would write
+# into ~/.nvm/versions/*/lib).
+[[path_beneath]]
+allowed_access = ["abi.read_execute"]
+parent = [
+    "${home}/.nvm",
+]

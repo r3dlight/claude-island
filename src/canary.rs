@@ -1,0 +1,180 @@
+// SPDX-FileCopyrightText: 2026 Stephane N
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Canary suite: regression tests executed INSIDE the sandbox
+// (`claude-island check` copies the binary into the project and re-runs it
+// in __canary mode through `island run`). Each canary attempts an access
+// that must be denied (a leak = FAIL) or allowed (nominal operation).
+
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Command, ExitCode};
+use std::time::Duration;
+
+enum Verdict {
+    Pass,
+    Fail(String),
+    Skip(String),
+}
+
+use Verdict::{Fail, Pass, Skip};
+
+/// An access that MUST be denied by Landlock (EACCES/EPERM).
+fn expect_denied(res: std::io::Result<()>) -> Verdict {
+    match res {
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+        Err(e) if e.kind() == ErrorKind::NotFound => Skip("target absent".into()),
+        Err(e) => Skip(format!("unexpected error: {e}")),
+        Ok(()) => Fail("access GRANTED where it should be denied".into()),
+    }
+}
+
+/// An access that MUST work (otherwise the sandbox is too strict).
+fn expect_allowed(res: std::io::Result<()>) -> Verdict {
+    match res {
+        Ok(()) => Pass,
+        Err(e) => Fail(format!("denied where it should work: {e}")),
+    }
+}
+
+fn connect(addr: &str) -> std::io::Result<()> {
+    let sa: SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, format!("bad address {addr}: {e}")))?;
+    TcpStream::connect_timeout(&sa, Duration::from_millis(500)).map(|_| ())
+}
+
+pub fn run_all(ro: bool) -> ExitCode {
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    let project = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut fails = 0u32;
+    let mut record = |name: &str, v: Verdict| match v {
+        Pass => println!("[PASS] {name}"),
+        Skip(why) => println!("[SKIP] {name} ({why})"),
+        Fail(why) => {
+            println!("[FAIL] {name}: {why}");
+            fails += 1;
+        }
+    };
+
+    // Preliminary detection: if $HOME is listable, the sandbox is inactive.
+    if fs::read_dir(&home).is_ok() {
+        println!("[FAIL] SANDBOX INACTIVE: $HOME is listable, no Landlock restriction applies");
+        println!("result: FAILURE (run outside the sandbox?)");
+        return ExitCode::from(1);
+    }
+
+    // Accesses that MUST be denied.
+    record("deny: list $HOME", expect_denied(fs::read_dir(&home).map(|_| ())));
+    record("deny: read ~/.ssh", expect_denied(fs::read_dir(home.join(".ssh")).map(|_| ())));
+    record("deny: read ~/.aws", expect_denied(fs::read_dir(home.join(".aws")).map(|_| ())));
+    record(
+        "deny: read ~/.config/gh",
+        expect_denied(fs::read_dir(home.join(".config/gh")).map(|_| ())),
+    );
+    record(
+        "deny: write ~/.zshrc",
+        expect_denied(OpenOptions::new().append(true).open(home.join(".zshrc")).map(|_| ())),
+    );
+    record(
+        "deny: write ~/.bashrc",
+        expect_denied(OpenOptions::new().append(true).open(home.join(".bashrc")).map(|_| ())),
+    );
+    record("deny: create a file at the root of $HOME", {
+        let p = home.join(".claude-island-canary-forbidden");
+        match File::create(&p) {
+            Ok(_) => {
+                let _ = fs::remove_file(&p);
+                Fail("creation GRANTED in $HOME".into())
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+            Err(e) => Skip(format!("unexpected error: {e}")),
+        }
+    });
+    record(
+        "deny: TCP bind on a non-allowed port (34567)",
+        match TcpListener::bind("127.0.0.1:34567") {
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+            Err(e) => Skip(format!("unexpected error: {e}")),
+            Ok(_) => Fail("bind GRANTED".into()),
+        },
+    );
+    record(
+        "deny: TCP connect to a non-allowed port (9)",
+        match connect("127.0.0.1:9") {
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+            Err(e) => Fail(format!("connect not blocked by Landlock ({e})")),
+            Ok(()) => Fail("connect GRANTED".into()),
+        },
+    );
+
+    // Project write: denied in --ro mode, required otherwise.
+    if ro {
+        record("deny (--ro): write inside the project", {
+            let p = project.join(".claude-island-canary-write");
+            match File::create(&p) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&p);
+                    Fail("write GRANTED in a read-only project".into())
+                }
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) => Skip(format!("unexpected error: {e}")),
+            }
+        });
+        record(
+            "allow (--ro): read the project",
+            expect_allowed(fs::read_dir(&project).map(|_| ())),
+        );
+    } else {
+        record("allow: write inside the project", {
+            let p = project.join(".claude-island-canary-write");
+            let r = File::create(&p).map(|_| ());
+            let _ = fs::remove_file(&p);
+            expect_allowed(r)
+        });
+    }
+    record(
+        "allow: read /etc/os-release",
+        expect_allowed(fs::read_to_string("/etc/os-release").map(|_| ())),
+    );
+    record(
+        "allow: execute /usr/bin/true",
+        expect_allowed(Command::new("/usr/bin/true").status().and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("non-zero exit code"))
+            }
+        })),
+    );
+    record("allow: write inside TMPDIR (workspace)", {
+        match env::var("TMPDIR") {
+            Ok(t) => {
+                let p = PathBuf::from(t).join("claude-island-canary");
+                let r = File::create(&p).map(|_| ());
+                let _ = fs::remove_file(&p);
+                expect_allowed(r)
+            }
+            Err(_) => Skip("TMPDIR not set".into()),
+        }
+    });
+    record(
+        "allow: TCP connect to port 443 (not blocked by Landlock)",
+        match connect("127.0.0.1:443") {
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                Fail("port 443 is denied".into())
+            }
+            _ => Pass, // connection refused or timeout = Landlock let it through
+        },
+    );
+
+    if fails > 0 {
+        println!("result: FAILURE ({fails} canary(ies) failed)");
+        return ExitCode::from(1);
+    }
+    println!("result: OK, the sandbox holds its promises");
+    ExitCode::SUCCESS
+}
