@@ -98,6 +98,7 @@ From a project directory under `$HOME`:
 claude-island                       base sandbox
 claude-island --rust                unlock cargo and rustup (already installed)
 claude-island --rust --node --c     environments are stackable
+claude-island --auto                detect environments from project files
 claude-island --ro                  project in READ-ONLY mode (code review)
 claude-island --noexec              deny running project files (combines with --ro)
 claude-island --proxy               network filtered by domain allowlist
@@ -107,6 +108,7 @@ claude-island check --ro            same, read-only variant
 claude-island check --proxy         same, domain-filtering variant
 claude-island update                update Island (pinned), rebuild, re-check
 claude-island explain --rust --ro   show what the profile would grant (no side effect)
+claude-island allow                 approve the project's .claude-island.toml
 claude-island --list                list available environments
 claude-island --serve               allow TCP bind on 3000, 4321, 5173, 8000, 8080
 claude-island --ports 9000,9443     additional bind ports
@@ -116,12 +118,43 @@ claude-island -- --resume           everything after -- is passed to claude
 
 Tuning: `CLAUDE_ISLAND_MEM` (default 8G), `CLAUDE_ISLAND_TASKS` (default 4096).
 
+### Per-project config: `.claude-island.toml`
+
+Committed at the project root, applied like command-line flags (merged with
+them), so plain `claude-island` does the right thing per project:
+
+```toml
+# .claude-island.toml
+envs = ["rust", "node"]      # or: auto = true
+proxy = true
+serve = true
+ports = [9443]
+allow = ["api.my-backend.dev"]
+# ro = true / noexec = true for review-only repositories
+```
+
+A cloned repository must not be able to grant itself rights, so the file
+follows the direnv model: it is **refused until you approve it** with
+`claude-island allow`, and any later change requires a new approval.
+Approvals (content hashes) live in `~/.config/claude-island/approved.list`,
+which the sandbox cannot write (covered by a canary). `explain` applies an
+unapproved file anyway, with a warning, so you can review what it would
+grant before approving. Unknown keys are an error: a typo cannot silently
+drop a setting.
+
 ## Dev environments
 
 **An environment flag installs nothing.** It only unlocks access to a
 toolchain that is already installed, and refuses with a clear message if it
 is missing. Without the flag, the toolchain is simply invisible: `cargo
 build` fails because `~/.cargo` cannot even be read.
+
+`--auto` detects environments from the project's root files (`Cargo.toml`
+brings rust, `package.json` brings node, `go.mod` brings go, `pyproject.toml`
+brings python3, `pom.xml`/`build.gradle` bring jvm, and so on) and combines
+with explicit flags. One difference: an auto-detected environment whose
+toolchain is missing is skipped with a warning instead of refusing, so
+`claude-island --auto` just works on polyglot repositories.
 
 | Flag | Checks | Unlocks |
 |------|--------|---------|

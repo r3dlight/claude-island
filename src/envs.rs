@@ -236,6 +236,82 @@ pub fn registry() -> Vec<EnvSpec> {
     reg
 }
 
+/// Marker files (project root only) mapped to environment names, for --auto.
+const AUTO_MARKERS: &[(&str, &str)] = &[
+    ("Cargo.toml", "rust"),
+    ("go.mod", "go"),
+    ("package.json", "node"),
+    ("deno.json", "deno"),
+    ("deno.jsonc", "deno"),
+    ("bun.lock", "bun"),
+    ("bun.lockb", "bun"),
+    ("pyproject.toml", "python3"),
+    ("requirements.txt", "python3"),
+    ("setup.py", "python3"),
+    ("Pipfile", "python3"),
+    ("uv.lock", "python3"),
+    ("pom.xml", "jvm"),
+    ("build.gradle", "jvm"),
+    ("build.gradle.kts", "jvm"),
+    ("settings.gradle", "jvm"),
+    ("settings.gradle.kts", "jvm"),
+    ("build.sbt", "jvm"),
+    ("Gemfile", "ruby"),
+    ("composer.json", "php"),
+    ("cpanfile", "perl"),
+    ("Makefile.PL", "perl"),
+    ("global.json", "dotnet"),
+    ("stack.yaml", "haskell"),
+    ("cabal.project", "haskell"),
+    ("mix.exs", "elixir"),
+    ("build.zig", "zig"),
+    ("CMakeLists.txt", "c"),
+    ("Makefile", "c"),
+    ("meson.build", "c"),
+    ("configure.ac", "c"),
+    (".mise.toml", "mise"),
+    ("mise.toml", "mise"),
+    (".tool-versions", "mise"),
+];
+
+/// Extensions of project-root files that imply an environment, for --auto.
+const AUTO_EXTENSIONS: &[(&str, &str)] = &[
+    ("csproj", "dotnet"),
+    ("sln", "dotnet"),
+    ("cabal", "haskell"),
+    ("gemspec", "ruby"),
+];
+
+/// Detects environments from the project's root files. Only returns names
+/// present in the registry, without duplicates, in detection order.
+pub fn auto_detect(project: &Path, registry: &[EnvSpec]) -> Vec<String> {
+    let mut found: Vec<String> = vec![];
+    let mut push = |name: &str| {
+        if registry.iter().any(|e| e.name == name) && !found.iter().any(|f| f == name) {
+            found.push(name.to_string());
+        }
+    };
+    for (file, env) in AUTO_MARKERS {
+        if project.join(file).exists() {
+            push(env);
+        }
+    }
+    if let Ok(entries) = fs::read_dir(project) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            for (x, env) in AUTO_EXTENSIONS {
+                if ext == *x {
+                    push(env);
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Resolves a flag name (or alias) to the canonical environment name.
 pub fn resolve(registry: &[EnvSpec], name: &str) -> Option<String> {
     registry

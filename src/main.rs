@@ -12,6 +12,7 @@ mod canary;
 mod envs;
 mod explain;
 mod profile;
+mod project_config;
 mod proxy;
 
 use std::env;
@@ -76,12 +77,18 @@ Usage:
                                        rebuild claude-island, re-run checks
   claude-island explain [OPTIONS]      show what the profile would grant,
                                        without writing or running anything
+  claude-island allow                  approve the project's .claude-island.toml
+                                       (required again after any change)
   claude-island --list                 list available environments
 
 Options:
   --<env>          grant access to an ALREADY INSTALLED toolchain
                    (stackable). Installs nothing: refuses if missing.
                    Aliases: --java/--kotlin/--scala -> jvm, --cpp -> c.
+  --auto           detect environments from project files (Cargo.toml ->
+                   rust, package.json -> node, go.mod -> go, ...); an
+                   auto-detected env whose toolchain is missing is skipped
+                   with a warning instead of refusing
   --ro             project in READ-ONLY mode (code review)
   --noexec         deny execve of project files (speed bump: interpreters
                    and the ld.so trick bypass it); combines with --ro
@@ -95,12 +102,17 @@ Options:
   --list           list environments and aliases
   -h, --help       this help
 
+A .claude-island.toml at the project root provides per-project defaults
+(envs, auto, ro, noexec, proxy, serve, ports, allow), merged with the
+command line. It is refused until approved with `claude-island allow`.
+
 Env: CLAUDE_ISLAND_MEM (default 8G), CLAUDE_ISLAND_TASKS (default 4096)
 ";
 
 #[derive(Default)]
 struct Opts {
     env_names: Vec<String>,
+    auto: bool,
     ro: bool,
     noexec: bool,
     proxy: bool,
@@ -135,6 +147,7 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
+            "--auto" => o.auto = true,
             "--ro" => o.ro = true,
             "--noexec" => o.noexec = true,
             "--proxy" => o.proxy = true,
@@ -207,16 +220,106 @@ fn guards() -> Result<(PathBuf, PathBuf)> {
     Ok((home, project))
 }
 
-fn selected<'a>(registry: &'a [envs::EnvSpec], names: &[String]) -> Result<Vec<&'a envs::EnvSpec>> {
-    names
-        .iter()
-        .map(|n| {
-            registry
-                .iter()
-                .find(|e| &e.name == n)
-                .ok_or_else(|| format!("internal error: unresolved environment {n}"))
-        })
-        .collect()
+/// Merges the project's .claude-island.toml (if any) into the options.
+/// The file must have been approved with `claude-island allow`; explain is
+/// lenient (warns and applies anyway, so the file can be reviewed).
+fn apply_project_config(
+    mut o: Opts,
+    home: &std::path::Path,
+    project: &std::path::Path,
+    registry: &[envs::EnvSpec],
+    lenient: bool,
+) -> Result<Opts> {
+    let path = project.join(project_config::FILE_NAME);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Ok(o);
+    };
+    let cfg = project_config::parse(&content).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !project_config::is_approved(home, project, &content) {
+        let msg = format!(
+            "{} is present but not approved: review it, then run `claude-island allow` \
+             (required again after any change)",
+            path.display()
+        );
+        if lenient {
+            eprintln!("claude-island: warning: {msg}");
+        } else {
+            return Err(msg);
+        }
+    }
+    eprintln!(
+        "claude-island: applied {} ({})",
+        project_config::FILE_NAME,
+        project_config::summary(&cfg)
+    );
+    for n in &cfg.envs {
+        let name = envs::resolve(registry, n)
+            .ok_or_else(|| format!("{}: unknown environment: {n}", path.display()))?;
+        if !o.env_names.contains(&name) {
+            o.env_names.push(name);
+        }
+    }
+    o.auto |= cfg.auto;
+    o.ro |= cfg.ro;
+    o.noexec |= cfg.noexec;
+    o.proxy |= cfg.proxy;
+    o.serve |= cfg.serve;
+    o.ports.extend(cfg.ports);
+    o.allow.extend(cfg.allow);
+    Ok(o)
+}
+
+/// Resolves the final environment list: explicit flags plus, with --auto,
+/// the environments detected from project files. Explicit environments must
+/// pass the toolchain check; auto-detected ones are skipped with a warning
+/// when their toolchain is missing. `check_presence` is off for explain.
+fn resolve_envs<'a>(
+    o: &Opts,
+    registry: &'a [envs::EnvSpec],
+    project: &std::path::Path,
+    home: &std::path::Path,
+    check_presence: bool,
+) -> Result<Vec<&'a envs::EnvSpec>> {
+    let mut names = o.env_names.clone();
+    let mut auto_names: Vec<String> = vec![];
+    if o.auto {
+        for n in envs::auto_detect(project, registry) {
+            if !names.contains(&n) {
+                names.push(n.clone());
+                auto_names.push(n);
+            }
+        }
+        if auto_names.is_empty() {
+            eprintln!("claude-island: --auto: no environment detected");
+        } else {
+            eprintln!(
+                "claude-island: --auto: detected environments: {}",
+                auto_names.join(", ")
+            );
+        }
+    }
+    let mut sel = vec![];
+    for n in &names {
+        let e = registry
+            .iter()
+            .find(|e| &e.name == n)
+            .ok_or_else(|| format!("internal error: unresolved environment {n}"))?;
+        if !check_presence {
+            sel.push(e);
+            continue;
+        }
+        match envs::verify(e, home) {
+            Ok(()) => {
+                envs::prepare(e, home);
+                sel.push(e);
+            }
+            Err(msg) if auto_names.contains(n) => {
+                eprintln!("claude-island: --auto: skipping {msg}");
+            }
+            Err(msg) => return Err(msg),
+        }
+    }
+    Ok(sel)
 }
 
 /// Proxy allowlist: base + environments + user file + --allow.
@@ -304,11 +407,8 @@ fn setup_network(o: &Opts, sel: &[&envs::EnvSpec], home: &std::path::Path) -> Re
 
 fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let (home, project) = guards()?;
-    let sel = selected(registry, &o.env_names)?;
-    for e in &sel {
-        envs::verify(e, &home)?;
-        envs::prepare(e, &home);
-    }
+    let o = apply_project_config(o, &home, &project, registry, false)?;
+    let sel = resolve_envs(&o, registry, &project, &home, true)?;
 
     let net = setup_network(&o, &sel, &home)?;
 
@@ -382,11 +482,8 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
 fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let (home, project) = guards()?;
-    let sel = selected(registry, &o.env_names)?;
-    for e in &sel {
-        envs::verify(e, &home)?;
-        envs::prepare(e, &home);
-    }
+    let o = apply_project_config(o, &home, &project, registry, false)?;
+    let sel = resolve_envs(&o, registry, &project, &home, true)?;
     let net = setup_network(&o, &sel, &home)?;
     let prof = profile::generate(
         &home,
@@ -442,7 +539,8 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 /// (nothing written, no proxy started, no toolchain check).
 fn cmd_explain(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let (home, project) = guards()?;
-    let sel = selected(registry, &o.env_names)?;
+    let o = apply_project_config(o, &home, &project, registry, true)?;
+    let sel = resolve_envs(&o, registry, &project, &home, false)?;
     let home_str = home.to_string_lossy().to_string();
     let project_str = project.to_string_lossy().to_string();
     let display = |p: &str| -> String {
@@ -557,6 +655,25 @@ fn cmd_explain(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `allow`: approve the project's .claude-island.toml (records its content
+/// hash; any later change to the file requires a new approval).
+fn cmd_allow(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
+    let (home, project) = guards()?;
+    let path = project.join(project_config::FILE_NAME);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let cfg = project_config::parse(&content).map_err(|e| format!("{}: {e}", path.display()))?;
+    for n in &cfg.envs {
+        envs::resolve(registry, n)
+            .ok_or_else(|| format!("{}: unknown environment: {n}", path.display()))?;
+    }
+    project_config::approve(&home, &project, &content)?;
+    println!("approved {} for {}", project_config::FILE_NAME, project.display());
+    println!("  {}", project_config::summary(&cfg));
+    println!("any change to the file will require a new `claude-island allow`");
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Runs a command and turns a failure into an error message.
 fn run_step(desc: &str, program: &str, args: &[&str]) -> Result<()> {
     eprintln!("claude-island: {desc}");
@@ -640,6 +757,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         }
         Some("__proxy") => proxy::standalone(&args[1..]),
         Some("update") => cmd_update(),
+        Some("allow") => {
+            let registry = envs::registry();
+            cmd_allow(&registry)
+        }
         Some("explain") => {
             let registry = envs::registry();
             match parse(&args[1..], &registry)? {
