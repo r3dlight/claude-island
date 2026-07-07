@@ -55,7 +55,7 @@ fn toml_str(s: &str) -> String {
 }
 
 /// The profile name for a given (project, environments, modes) tuple.
-pub fn name_for(project: &Path, envs: &[&EnvSpec], ro: bool, noexec: bool) -> String {
+pub fn name_for(project: &Path, envs: &[&EnvSpec], ro: bool, noexec: bool, deny: bool) -> String {
     let env_tag = if envs.is_empty() {
         String::new()
     } else {
@@ -69,14 +69,55 @@ pub fn name_for(project: &Path, envs: &[&EnvSpec], ro: bool, noexec: bool) -> St
     };
     let ro_tag = if ro { "-ro" } else { "" };
     let noexec_tag = if noexec { "-noexec" } else { "" };
+    let deny_tag = if deny { "-deny" } else { "" };
     format!(
-        "claude-{}{}{}{}-{}",
+        "claude-{}{}{}{}{}-{}",
         slug(project),
         env_tag,
         ro_tag,
         noexec_tag,
+        deny_tag,
         hash8(&project.to_string_lossy())
     )
+}
+
+/// The project filesystem rule(s). Without deny, a single rule grants the
+/// whole project. With deny, Landlock's union semantics forbid carving a
+/// hole under a granted tree, so instead we grant `read_dir` on the root
+/// (for listing and traversal) and the full access on each EXISTING
+/// top-level entry that is not denied. Consequence: new entries cannot be
+/// created directly at the project root (see README).
+fn project_rules(project: &Path, access: &str, deny: &[String]) -> String {
+    if deny.is_empty() {
+        return format!(
+            "[[path_beneath]]\nallowed_access = [{access}]\nparent = [\"${{project}}\"]\n"
+        );
+    }
+    let mut kept: Vec<String> = vec![];
+    if let Ok(entries) = fs::read_dir(project) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !deny.iter().any(|d| d == &name) {
+                kept.push(toml_str(&project.join(&name).to_string_lossy()));
+            }
+        }
+    }
+    kept.sort();
+    let mut body = format!(
+        "[[path_beneath]]\nallowed_access = [\"read_dir\"]\nparent = [\"{}\"]\n",
+        toml_str(&project.to_string_lossy())
+    );
+    if !kept.is_empty() {
+        let arr = kept
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str(&format!(
+            "\n[[path_beneath]]\nallowed_access = [{access}]\nparent = [{arr}]\n"
+        ));
+    }
+    body
 }
 
 pub fn generate(
@@ -85,6 +126,7 @@ pub fn generate(
     envs: &[&EnvSpec],
     ro: bool,
     noexec: bool,
+    deny: &[String],
     serve_ports: &[u16],
     connect_ports: &[u16],
     extra_env: &[(String, String)],
@@ -94,7 +136,7 @@ pub fn generate(
         fs::create_dir_all(home.join(d))?;
     }
 
-    let name = name_for(project, envs, ro, noexec);
+    let name = name_for(project, envs, ro, noexec, !deny.is_empty());
     let dir = home.join(".config/island/profiles").join(&name);
     let _ = fs::remove_dir_all(&dir);
     let landlock = dir.join("landlock");
@@ -127,7 +169,7 @@ pub fn generate(
     };
     fs::write(
         landlock.join("15-project.toml"),
-        format!("{HEADER}\n[[path_beneath]]\nallowed_access = [{access}]\nparent = [\"${{project}}\"]\n"),
+        format!("{HEADER}\n{}", project_rules(project, access, deny)),
     )?;
 
     fs::write(
@@ -150,10 +192,10 @@ pub fn generate(
     // Island grants FULL filesystem access (write AND execute) beneath
     // every [[context]] when_beneath path (treated as a workspace,
     // AccessFs::from_all in island's workspace.rs), which would override a
-    // restricted project rule by union. In --ro and --noexec modes the
-    // profile therefore declares no context: it is only usable through
+    // restricted project rule by union. In --ro, --noexec and --deny modes
+    // the profile therefore declares no context: it is only usable through
     // explicit selection (-p), which is how the wrapper always launches it.
-    let mut p = if ro || noexec {
+    let mut p = if ro || noexec || !deny.is_empty() {
         String::new()
     } else {
         format!(

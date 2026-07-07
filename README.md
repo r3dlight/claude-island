@@ -101,6 +101,7 @@ claude-island --rust --node --c     environments are stackable
 claude-island --auto                detect environments from project files
 claude-island --ro                  project in READ-ONLY mode (code review)
 claude-island --noexec              deny running project files (combines with --ro)
+claude-island --deny .git --deny .env  protect top-level entries from the agent
 claude-island --proxy               network filtered by domain allowlist
 claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
 claude-island check                 canary suite: verify the sandbox holds
@@ -229,6 +230,38 @@ Note: an `--ro` profile declares no Island `[[context]]`, because Island
 grants full access beneath context paths (they are treated as workspaces).
 The wrapper always selects profiles explicitly, so nothing is lost; the zsh
 auto-activation hook simply never picks up an `--ro` profile.
+
+## Protecting secrets inside the project: `--deny`
+
+The project is granted as one tree, so a `.env` or a private key committed
+*inside* the repo is readable by the agent by default. `--deny <name>`
+carves those out:
+
+```sh
+claude-island --deny .git --deny .env --deny secrets
+# or in .claude-island.toml:  deny = [".git", ".env", "secrets"]
+```
+
+For each denied top-level entry, the agent **cannot read its file contents
+and cannot write it**. This is pure Landlock: since Landlock unions rules
+and cannot subtract from a granted tree, the wrapper stops granting the
+whole project and instead grants each top-level entry individually, skipping
+the denied ones (the project root keeps a `read_dir` grant so listing and
+navigation still work).
+
+Two honest limitations of the pure-Landlock approach:
+
+* **New files cannot be created directly at the project root** (existing
+  files and granted subdirectories stay fully writable, so editing `src/*`
+  and adding `src/newmod.rs` work). Create new top-level files outside the
+  sandbox.
+* **Names may still appear in a listing**: the root `read_dir` grant
+  propagates, so `ls secrets/` can show that `creds` exists, but
+  `cat secrets/creds` is denied. Contents and writes are protected, not the
+  existence of names.
+
+v1 supports project **top-level** names only (no `src/secret`). Verify with
+`claude-island check --deny <name>`.
 
 ## Good to know
 

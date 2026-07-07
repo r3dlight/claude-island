@@ -85,6 +85,7 @@ pub struct Modes {
     pub ro: bool,
     pub noexec: bool,
     pub proxy: bool,
+    pub deny: Vec<String>,
 }
 
 pub fn run_all(m: Modes) -> ExitCode {
@@ -196,9 +197,11 @@ pub fn run_all(m: Modes) -> ExitCode {
         },
     );
 
-    // Project execution probe (a copy of /usr/bin/true placed by cmd_check
-    // before sandboxing): denied in --noexec mode, required otherwise.
-    let probe = project.join(".claude-island-canary-exec");
+    // Probes live in a dedicated granted subdir (.claude-island-canary-dir,
+    // placed by cmd_check before sandboxing) so they work in every mode,
+    // including deny mode where the project root is no longer writable.
+    let cdir = project.join(".claude-island-canary-dir");
+    let probe = cdir.join("exec");
     if m.noexec {
         record(
             "deny (--noexec): execute a file inside the project",
@@ -221,10 +224,10 @@ pub fn run_all(m: Modes) -> ExitCode {
         );
     }
 
-    // Project write: denied in --ro mode, required otherwise.
+    // Project write into the granted subdir: denied in --ro, required otherwise.
     if m.ro {
         record("deny (--ro): write inside the project", {
-            let p = project.join(".claude-island-canary-write");
+            let p = cdir.join("w");
             match File::create(&p) {
                 Ok(_) => {
                     let _ = fs::remove_file(&p);
@@ -240,11 +243,69 @@ pub fn run_all(m: Modes) -> ExitCode {
         );
     } else {
         record("allow: write inside the project", {
-            let p = project.join(".claude-island-canary-write");
+            let p = cdir.join("w");
             let r = File::create(&p).map(|_| ());
             let _ = fs::remove_file(&p);
             expect_allowed(r)
         });
+    }
+
+    // Deny mode: the CONTENTS of denied entries must be unreadable and they
+    // must be unwritable. (Directory listings under a denied dir may still
+    // leak names, because the read_dir grant on the project root propagates
+    // to the subtree; contents and writes are what is actually protected.)
+    // Also, the project root must not accept a new file (the documented
+    // trade-off), while listing the root still works.
+    if !m.deny.is_empty() {
+        // Authoritative: a known secret file inside the synthetic denied dir.
+        record(
+            "deny (--deny): read contents of a denied file",
+            match fs::read(project.join(".claude-island-canary-denied/secret")) {
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) if e.kind() == ErrorKind::NotFound => Skip("synthetic secret absent".into()),
+                Err(e) => Skip(format!("unexpected error: {e}")),
+                Ok(_) => Fail("denied file contents are readable".into()),
+            },
+        );
+        record(
+            "deny (--deny): write into a denied dir",
+            match File::create(project.join(".claude-island-canary-denied/planted")) {
+                Ok(_) => Fail("write GRANTED into a denied dir".into()),
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) if e.kind() == ErrorKind::NotFound => Skip("synthetic denied dir absent".into()),
+                Err(e) => Skip(format!("unexpected error: {e}")),
+            },
+        );
+        // Best effort on user-specified entries that are plain files.
+        for name in &m.deny {
+            if name.starts_with(".claude-island-canary") {
+                continue;
+            }
+            record(
+                &format!("deny (--deny): read contents of ~project/{name}"),
+                match fs::read(project.join(name)) {
+                    Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                    Err(e) if e.kind() == ErrorKind::NotFound => Skip("entry absent".into()),
+                    Err(_) => Skip("not a plain file (dir contents covered above)".into()),
+                    Ok(_) => Fail(format!("{name} contents are readable despite --deny")),
+                },
+            );
+        }
+        record(
+            "deny (--deny): create a new file at the project root",
+            match File::create(project.join(".claude-island-canary-rootnew")) {
+                Ok(_) => {
+                    let _ = fs::remove_file(project.join(".claude-island-canary-rootnew"));
+                    Fail("root file creation GRANTED under --deny".into())
+                }
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
+                Err(e) => Skip(format!("unexpected error: {e}")),
+            },
+        );
+        record(
+            "allow (--deny): list the project root",
+            expect_allowed(fs::read_dir(&project).map(|_| ())),
+        );
     }
     record(
         "allow: read /etc/os-release",

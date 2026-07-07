@@ -17,6 +17,7 @@
 //   serve = true
 //   ports = [9443, 9444]
 //   allow = ["api.example.dev"]
+//   deny = [".git", ".env", "secrets"]
 
 use std::fs;
 use std::path::Path;
@@ -34,6 +35,7 @@ pub struct ProjectConfig {
     pub serve: bool,
     pub ports: Vec<u16>,
     pub allow: Vec<String>,
+    pub deny: Vec<String>,
 }
 
 fn parse_bool(v: &str, line: usize) -> Result<bool, String> {
@@ -97,6 +99,7 @@ pub fn parse(content: &str) -> Result<ProjectConfig, String> {
             "serve" => c.serve = parse_bool(value, n)?,
             "envs" => c.envs = parse_str_array(value, n)?,
             "allow" => c.allow = parse_str_array(value, n)?,
+            "deny" => c.deny = parse_str_array(value, n)?,
             "ports" => c.ports = parse_port_array(value, n)?,
             _ => return Err(format!("line {n}: unknown key: {key}")),
         }
@@ -173,6 +176,9 @@ pub fn summary(c: &ProjectConfig) -> String {
     }
     if !c.allow.is_empty() {
         parts.push(format!("allow: {}", c.allow.join(", ")));
+    }
+    if !c.deny.is_empty() {
+        parts.push(format!("deny: {}", c.deny.join(", ")));
     }
     if parts.is_empty() {
         "empty configuration".to_string()

@@ -92,6 +92,10 @@ Options:
   --ro             project in READ-ONLY mode (code review)
   --noexec         deny execve of project files (speed bump: interpreters
                    and the ld.so trick bypass it); combines with --ro
+  --deny NAME      protect a top-level project entry (e.g. .git, .env,
+                   secrets): its file contents become unreadable and it
+                   cannot be written (repeatable). Names may still appear in
+                   a listing. Trade-off: no new files at the project root.
   --proxy          network restricted to a domain-filtering proxy
                    (allowlist: base domains + environments + --allow +
                    ~/.config/claude-island/domains.allow)
@@ -115,6 +119,7 @@ struct Opts {
     auto: bool,
     ro: bool,
     noexec: bool,
+    deny: Vec<String>,
     proxy: bool,
     serve: bool,
     ports: Vec<u16>,
@@ -162,6 +167,11 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
                 i += 1;
                 let v = args.get(i).ok_or("--allow expects a domain")?;
                 o.allow.push(v.clone());
+            }
+            "--deny" => {
+                i += 1;
+                let v = args.get(i).ok_or("--deny expects a project top-level name")?;
+                o.deny.push(v.clone());
             }
             "--list" => return Ok(Parsed::List),
             "-h" | "--help" => return Ok(Parsed::Help),
@@ -220,6 +230,20 @@ fn guards() -> Result<(PathBuf, PathBuf)> {
     Ok((home, project))
 }
 
+/// Validates deny entries: v1 supports project top-level names only (a
+/// nested deny like `src/secret` cannot be carved without also restricting
+/// `src`, which is surprising, so it is rejected for now).
+fn validate_deny(deny: &[String]) -> Result<()> {
+    for d in deny {
+        if d.is_empty() || d == "." || d == ".." || d.contains('/') || d.contains('\\') {
+            return Err(format!(
+                "--deny {d}: only project top-level names are supported (no '/', no '..')"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Merges the project's .claude-island.toml (if any) into the options.
 /// The file must have been approved with `claude-island allow`; explain is
 /// lenient (warns and applies anyway, so the file can be reviewed).
@@ -266,6 +290,7 @@ fn apply_project_config(
     o.serve |= cfg.serve;
     o.ports.extend(cfg.ports);
     o.allow.extend(cfg.allow);
+    o.deny.extend(cfg.deny);
     Ok(o)
 }
 
@@ -408,6 +433,7 @@ fn setup_network(o: &Opts, sel: &[&envs::EnvSpec], home: &std::path::Path) -> Re
 fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let (home, project) = guards()?;
     let o = apply_project_config(o, &home, &project, registry, false)?;
+    validate_deny(&o.deny)?;
     let sel = resolve_envs(&o, registry, &project, &home, true)?;
 
     let net = setup_network(&o, &sel, &home)?;
@@ -424,6 +450,7 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         &sel,
         o.ro,
         o.noexec,
+        &o.deny,
         &serve_ports,
         &net.connect_ports,
         &net.extra_env,
@@ -483,35 +510,55 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let (home, project) = guards()?;
     let o = apply_project_config(o, &home, &project, registry, false)?;
+    validate_deny(&o.deny)?;
     let sel = resolve_envs(&o, registry, &project, &home, true)?;
+    if !envs::has_cmd("island") {
+        return Err("island not found in PATH: run ./install.sh first".into());
+    }
     let net = setup_network(&o, &sel, &home)?;
+
+    // Canary artifacts, created BEFORE profile generation so the carve logic
+    // (deny mode) enumerates and grants them: a dedicated dir holding the
+    // exec/write probes (a top-level entry, granted in every mode), plus, in
+    // deny mode, a synthetic denied dir with a secret to prove carving hides
+    // it. Cleaned up afterwards.
+    let canary_dir = project.join(".claude-island-canary-dir");
+    std::fs::create_dir_all(&canary_dir)
+        .map_err(|e| format!("creating canary dir: {e}"))?;
+    std::fs::copy("/usr/bin/true", canary_dir.join("exec"))
+        .map_err(|e| format!("exec probe copy: {e}"))?;
+
+    let mut deny = o.deny.clone();
+    let denied_dir = project.join(".claude-island-canary-denied");
+    if !deny.is_empty() {
+        std::fs::create_dir_all(&denied_dir).map_err(|e| format!("creating denied dir: {e}"))?;
+        std::fs::write(denied_dir.join("secret"), "canary-secret\n")
+            .map_err(|e| format!("writing denied secret: {e}"))?;
+        deny.push(".claude-island-canary-denied".to_string());
+    }
+
     let prof = profile::generate(
         &home,
         &project,
         &sel,
         o.ro,
         o.noexec,
+        &deny,
         &[],
         &net.connect_ports,
         &net.extra_env,
     )
     .map_err(|e| format!("profile generation: {e}"))?;
-    if !envs::has_cmd("island") {
-        return Err("island not found in PATH: run ./install.sh first".into());
-    }
 
     // The current binary is copied into ~/.local/bin (read + exec in every
-    // profile, unlike the project which loses exec with --noexec) then
-    // re-run in canary mode. Both copies happen before sandboxing.
+    // profile) then re-run in canary mode. All copies happen before
+    // sandboxing.
     let exe = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let bin_dir = home.join(".local/bin");
     std::fs::create_dir_all(&bin_dir)
         .map_err(|e| format!("creating {}: {e}", bin_dir.display()))?;
     let target = bin_dir.join(".claude-island-canary");
     std::fs::copy(&exe, &target).map_err(|e| format!("canary copy: {e}"))?;
-    // Execution probe inside the project, for the exec canaries.
-    let probe = project.join(".claude-island-canary-exec");
-    std::fs::copy("/usr/bin/true", &probe).map_err(|e| format!("exec probe copy: {e}"))?;
 
     eprintln!("claude-island: canaries inside sandbox \"{}\"", prof.name);
     let mut cmd = Command::new("island");
@@ -527,9 +574,13 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     if o.proxy {
         cmd.arg("--proxy");
     }
+    for d in &deny {
+        cmd.arg("--deny").arg(d);
+    }
     let status = cmd.status();
     let _ = std::fs::remove_file(&target);
-    let _ = std::fs::remove_file(&probe);
+    let _ = std::fs::remove_dir_all(&canary_dir);
+    let _ = std::fs::remove_dir_all(&denied_dir);
     let status = status.map_err(|e| format!("failed to run island: {e}"))?;
     Ok(exit_code(status))
 }
@@ -540,6 +591,7 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 fn cmd_explain(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let (home, project) = guards()?;
     let o = apply_project_config(o, &home, &project, registry, true)?;
+    validate_deny(&o.deny)?;
     let sel = resolve_envs(&o, registry, &project, &home, false)?;
     let home_str = home.to_string_lossy().to_string();
     let project_str = project.to_string_lossy().to_string();
@@ -555,7 +607,7 @@ fn cmd_explain(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
     println!(
         "profile: {}",
-        profile::name_for(&project, &sel, o.ro, o.noexec)
+        profile::name_for(&project, &sel, o.ro, o.noexec, !o.deny.is_empty())
     );
     let mode = match (o.ro, o.noexec) {
         (false, false) => "rw + exec",
@@ -596,6 +648,12 @@ fn cmd_explain(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         if let Some(paths) = groups.get(label) {
             println!("  {label:<11} {}", paths.join(", "));
         }
+    }
+    if !o.deny.is_empty() {
+        println!(
+            "  protected   {} (contents unreadable, unwritable; names may still list)",
+            o.deny.join(", ")
+        );
     }
 
     println!("\nnetwork");
@@ -749,10 +807,17 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
     match args.first().map(String::as_str) {
         Some("__canary") => {
             let rest = &args[1..];
+            let deny: Vec<String> = rest
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| *a == "--deny" && rest.get(i + 1).is_some())
+                .map(|(i, _)| rest[i + 1].clone())
+                .collect();
             Ok(canary::run_all(canary::Modes {
                 ro: rest.iter().any(|a| a == "--ro"),
                 noexec: rest.iter().any(|a| a == "--noexec"),
                 proxy: rest.iter().any(|a| a == "--proxy"),
+                deny,
             }))
         }
         Some("__proxy") => proxy::standalone(&args[1..]),
