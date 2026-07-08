@@ -104,6 +104,7 @@ claude-island --noexec              deny running project files (combines with --
 claude-island --deny .git --deny .env  protect top-level entries from the agent
 claude-island --proxy               network filtered by domain allowlist
 claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
+claude-island denials -- cargo build  run a command, report every access it was denied
 claude-island check                 canary suite: verify the sandbox holds
 claude-island check --ro            same, read-only variant
 claude-island check --proxy         same, domain-filtering variant
@@ -262,6 +263,36 @@ Two honest limitations of the pure-Landlock approach:
 
 v1 supports project **top-level** names only (no `src/secret`). Verify with
 `claude-island check --deny <name>`.
+
+## Diagnosing denials: `claude-island denials`
+
+When a command misbehaves inside the sandbox, this tells you exactly what it
+was denied and how to grant it. It runs the command under `strace` (the
+tracer sits outside the sandbox), collects every syscall that failed with
+`EACCES`/`EPERM` (the Landlock denial errnos), and reports them deduplicated
+with a suggested fix:
+
+```
+$ claude-island denials -- sh -c 'cargo build; cat ~/.ssh/id_ed25519'
+2 distinct denial(s):
+  exec    ~/.cargo/bin/cargo   (execve EACCES) x1
+          -> run with --rust to grant it
+  read    ~/.ssh/id_ed25519    (openat EACCES) x1
+          -> add a snippet granting read on ~/.ssh
+```
+
+Suggestions map known toolchain directories to their `--<env>` flag; other
+paths get a snippet hint, and network denials report the port. `--json`
+emits one JSON object per denial for tooling:
+
+```
+$ claude-island denials --json -- cargo build
+{"kind":"exec","target":"/home/user/.cargo/bin/cargo","syscall":"execve","errno":"EACCES","count":1}
+```
+
+This is the privilege-free path: the kernel Landlock audit log (ABI 7) needs
+root or auditd to read, whereas strace traces our own process tree. Requires
+`strace` in `PATH`.
 
 ## Good to know
 

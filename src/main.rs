@@ -9,6 +9,7 @@
 // as Result<_, String> to main, which prints one clean message and exits 2.
 
 mod canary;
+mod denials;
 mod envs;
 mod explain;
 mod profile;
@@ -77,6 +78,8 @@ Usage:
                                        rebuild claude-island, re-run checks
   claude-island explain [OPTIONS]      show what the profile would grant,
                                        without writing or running anything
+  claude-island denials [OPTS] -- CMD  run CMD in the sandbox and report every
+                                       access it denied (add --json for JSONL)
   claude-island allow                  approve the project's .claude-island.toml
                                        (required again after any change)
   claude-island --list                 list available environments
@@ -103,6 +106,7 @@ Options:
   --serve          allow TCP bind on 3000, 4321, 5173, 8000, 8080
   --ports P1,P2    additional bind ports
   --dry-run        generate the profile and print the command without running
+  --json           machine-readable JSONL output (denials only)
   --list           list environments and aliases
   -h, --help       this help
 
@@ -125,6 +129,7 @@ struct Opts {
     ports: Vec<u16>,
     allow: Vec<String>,
     dry_run: bool,
+    json: bool,
     rest: Vec<String>,
 }
 
@@ -158,6 +163,7 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
             "--proxy" => o.proxy = true,
             "--serve" => o.serve = true,
             "--dry-run" => o.dry_run = true,
+            "--json" => o.json = true,
             "--ports" => {
                 i += 1;
                 let v = args.get(i).ok_or("--ports expects a port list")?;
@@ -732,6 +738,105 @@ fn cmd_allow(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// A one-line suggestion for how to lift a filesystem denial, using the
+/// environment registry to map known toolchain dirs to their --flag.
+fn suggest_fs(target: &str, kind: &str, home: &std::path::Path, registry: &[envs::EnvSpec]) -> String {
+    let home_s = home.to_string_lossy();
+    // Under a known environment directory? Suggest the flag.
+    if let Some(rel) = target.strip_prefix(&*home_s).and_then(|r| r.strip_prefix('/')) {
+        for e in registry {
+            if e.dirs.iter().chain(e.create.iter()).any(|d| rel == *d || rel.starts_with(&format!("{d}/"))) {
+                return format!("run with --{} to grant it", e.name);
+            }
+        }
+    }
+    // Otherwise suggest a snippet rule on the parent directory.
+    let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or(target);
+    let display = parent.strip_prefix(&*home_s).map(|r| format!("~{r}")).unwrap_or_else(|| parent.to_string());
+    let access = if kind == "exec" { "read + exec" } else if kind == "write" { "rw" } else { "read" };
+    format!("add a snippet granting {access} on {display}")
+}
+
+/// `denials`: run a command inside the sandbox under strace and report the
+/// accesses it was denied, with suggestions for how to grant them.
+fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
+    let (home, project) = guards()?;
+    let o = apply_project_config(o, &home, &project, registry, false)?;
+    validate_deny(&o.deny)?;
+    if o.rest.is_empty() {
+        return Err("denials requires a command: claude-island denials [flags] -- <command>".into());
+    }
+    if !envs::has_cmd("strace") {
+        return Err("strace not found in PATH: install it (the kernel audit path needs root)".into());
+    }
+    if !envs::has_cmd("island") {
+        return Err("island not found in PATH: run ./install.sh first".into());
+    }
+    let sel = resolve_envs(&o, registry, &project, &home, true)?;
+    let net = setup_network(&o, &sel, &home)?;
+    let mut serve_ports: Vec<u16> = vec![];
+    if o.serve {
+        serve_ports.extend_from_slice(DEV_SERVE_PORTS);
+    }
+    serve_ports.extend(&o.ports);
+    let prof = profile::generate(
+        &home, &project, &sel, o.ro, o.noexec, &o.deny, &serve_ports,
+        &net.connect_ports, &net.extra_env,
+    )
+    .map_err(|e| format!("profile generation: {e}"))?;
+
+    let log = home.join(".cache/claude-island/denials.strace");
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("creating cache dir: {e}"))?;
+    }
+
+    // strace traces from OUTSIDE the sandbox (it is the ancestor of the
+    // process tree); island applies Landlock then execs the command.
+    eprintln!("claude-island: tracing `{}` in sandbox \"{}\"", o.rest.join(" "), prof.name);
+    let mut cmd = Command::new("strace");
+    cmd.args(["-f", "-Z", "-y", "-qq", "-e", "trace=%file,%network", "-o"])
+        .arg(&log)
+        .args(["island", "run", "-p", &prof.name, "--"])
+        .args(&o.rest);
+    scrub_env(&mut cmd);
+    let _ = cmd.status().map_err(|e| format!("failed to run strace: {e}"))?;
+
+    let output = std::fs::read_to_string(&log).map_err(|e| format!("reading strace log: {e}"))?;
+    let _ = std::fs::remove_file(&log);
+    let found = denials::parse(&output);
+
+    if o.json {
+        for d in &found {
+            println!("{}", d.to_json());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if found.is_empty() {
+        println!("no denials: the command ran without hitting the sandbox");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("{} distinct denial(s):", found.len());
+    for d in &found {
+        let display = d.target.strip_prefix(&*home.to_string_lossy())
+            .map(|r| format!("~{r}")).unwrap_or_else(|| d.target.clone());
+        println!("  {:<7} {:<48} ({} {}) x{}", d.kind, display, d.syscall, d.errno, d.count);
+        let hint = match d.kind.as_str() {
+            "connect" | "bind" => {
+                let port = d.target.rsplit_once(':').map(|(_, p)| p).unwrap_or("?");
+                if o.proxy {
+                    format!("add the domain to the --proxy allowlist (denied port {port})")
+                } else {
+                    format!("allow port {port} with --serve/--ports, or check --proxy allowlist")
+                }
+            }
+            _ => suggest_fs(&d.target, &d.kind, &home, registry),
+        };
+        println!("          -> {hint}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Runs a command and turns a failure into an error message.
 fn run_step(desc: &str, program: &str, args: &[&str]) -> Result<()> {
     eprintln!("claude-island: {desc}");
@@ -822,6 +927,20 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         }
         Some("__proxy") => proxy::standalone(&args[1..]),
         Some("update") => cmd_update(),
+        Some("denials") => {
+            let registry = envs::registry();
+            match parse(&args[1..], &registry)? {
+                Parsed::Go(o) => cmd_denials(o, &registry),
+                Parsed::Help => {
+                    print!("{HELP}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                Parsed::List => {
+                    print_list(&registry);
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
         Some("allow") => {
             let registry = envs::registry();
             cmd_allow(&registry)
