@@ -18,6 +18,7 @@ mod profile;
 mod project_config;
 mod proxy;
 mod pty;
+mod report;
 
 use std::env;
 use std::path::PathBuf;
@@ -89,6 +90,8 @@ Usage:
                                        access it denied (add --json for JSONL)
   claude-island allow                  approve the project's .claude-island.toml
                                        (required again after any change)
+  claude-island report [--all]         summarize what tried to leave the sandbox
+                                       (leak attempts + L7 denials from the audit)
   claude-island watch                  live-approve domains blocked by --ask
   claude-island approve [DOMAIN...]    approve blocked domains (--all for every
                                        pending one); no args lists them
@@ -745,6 +748,7 @@ fn cmd_completion(shell: Option<&String>, registry: &[envs::EnvSpec]) -> Result<
         "explain",
         "denials",
         "allow",
+        "report",
         "watch",
         "approve",
         "completion",
@@ -1540,6 +1544,28 @@ fn cmd_approve(args: &[String]) -> Result<ExitCode> {
 
 /// `watch`: poll the pending file and interactively approve new domains.
 /// Universal: runs in its own terminal, needs no notifier and no tmux.
+/// `report [--all]`: summarize the outbound-audit log into what tried to
+/// leave the sandbox and where (last session by default, or `--all`).
+fn cmd_report(args: &[String]) -> Result<ExitCode> {
+    let home = PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set")?);
+    let all = args.iter().any(|a| a == "--all");
+    let path = home.join(".cache/claude-island/outbound-audit.log");
+    let log = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            println!(
+                "claude-island: no audit log yet ({}). Run with --inspect or --detect first.",
+                path.display()
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
+    let r = report::parse(&log, !all);
+    let scope = if all { "all sessions" } else { "last session" };
+    print!("{}", report::render(&r, scope));
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_watch() -> Result<ExitCode> {
     use std::io::{BufRead, Write as _};
     let home = PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set")?);
@@ -1673,6 +1699,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         }
         Some("__proxy") => proxy::standalone(&args[1..]),
         Some("update") => cmd_update(),
+        Some("report") => cmd_report(&args[1..]),
         Some("watch") => cmd_watch(),
         Some("approve") => cmd_approve(&args[1..]),
         Some("completion") => cmd_completion(args.get(1), &envs::registry()),

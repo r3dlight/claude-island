@@ -146,6 +146,7 @@ claude-island --broker              gh/git/curl reach GitHub without the token e
 claude-island --inspect             log every outbound request (plaintext) for review
 claude-island --detect              block local code from leaving to non-Anthropic hosts
 claude-island --l7                  restrict terminated hosts to a method/path allowlist
+claude-island report [--all]        summarize what tried to leave the sandbox
 claude-island denials -- cargo build  run a command, report every access it was denied
 claude-island check                 canary suite: verify the sandbox holds
 claude-island check --ro            same, read-only variant
@@ -399,6 +400,21 @@ automatically and recorded as `!!! LEAK BLOCKED` in the audit log.
 Test it end to end with `scripts/test-detect.sh` (it exercises plain,
 gzipped, honeytoken and benign cases and checks each verdict), or ask Claude
 to `curl` a project file to an allowlisted test host and watch it get blocked.
+
+After (or during) a session, `claude-island report` summarizes the audit log
+into what tried to leave and where:
+
+```
+$ claude-island report
+claude-island session report (last session)
+  outbound requests: 142 to 6 host(s)
+
+  LEAK ATTEMPTS (2 blocked, 0 allowed):
+    BLOCKED  AWS access key            -> webhook.site
+    BLOCKED  code from src/algo.rs     -> pastebin.com  x3
+```
+
+`--all` covers every session in the log instead of only the last one.
 
 ### Method/path allowlist: `--l7`
 
