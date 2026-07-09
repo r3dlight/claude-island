@@ -13,10 +13,33 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+
+use crate::detect::Detector;
+use crate::pty::Prompter;
+
+/// Hosts that legitimately carry your code (the Anthropic API): audited but
+/// never flagged as a leak, so `--detect` does not alarm on normal use.
+const CODE_EXPECTED: &[&str] = &["api.anthropic.com", "statsig.anthropic.com"];
+
+/// Largest request body buffered for leak scanning; larger ones stream
+/// unscanned (source files are small, so this misses little).
+const SCAN_CAP: usize = 8 * 1024 * 1024;
+
+/// Inspects an outbound body and returns whether to proceed (false = block).
+type Inspector<'a> = &'a dyn Fn(&[u8]) -> bool;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// A credential to inject for a set of hosts. GitHub wants `Bearer` for the
 /// REST API but Basic auth for git-over-HTTPS, so the header is computed per
@@ -64,14 +87,47 @@ pub struct Broker {
     leaves: Mutex<HashMap<String, Arc<ServerConfig>>>,
     creds: Vec<Credential>,
     upstream_roots: Arc<RootCertStore>,
+    /// Inspection mode (--inspect): terminate EVERY host and audit outbound
+    /// requests. The file is opened once and guarded by a mutex so concurrent
+    /// request threads do not interleave their lines.
+    inspect: bool,
+    audit: Option<Mutex<std::fs::File>>,
+    /// Leak detection (--detect): scan outbound bodies against the project.
+    detector: Option<Arc<Detector>>,
+    /// Inline prompter (--ask): ask the user before blocking a detected leak,
+    /// instead of blocking outright.
+    prompter: Option<Prompter>,
 }
 
 impl Broker {
-    /// Builds a broker with an ephemeral CA. Returns None if no credentials.
-    pub fn new(creds: Vec<Credential>) -> Result<Option<Arc<Broker>>, String> {
-        if creds.is_empty() {
+    /// Builds a broker with an ephemeral CA. Returns None if there is nothing
+    /// to do (no credentials and no inspection).
+    pub fn new(
+        creds: Vec<Credential>,
+        inspect: bool,
+        audit_path: Option<PathBuf>,
+        detector: Option<Arc<Detector>>,
+        prompter: Option<Prompter>,
+    ) -> Result<Option<Arc<Broker>>, String> {
+        if creds.is_empty() && !inspect {
             return Ok(None);
         }
+        let audit = match audit_path {
+            Some(p) => {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .map_err(|e| format!("opening audit log {}: {e}", p.display()))?;
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                writeln!(f, "[{ts}] === session start ===").ok();
+                Some(Mutex::new(f))
+            }
+            None => None,
+        };
         // Install the ring crypto provider (idempotent, ignore if already set).
         rustls::crypto::ring::default_provider()
             .install_default()
@@ -106,6 +162,10 @@ impl Broker {
             leaves: Mutex::new(HashMap::new()),
             creds,
             upstream_roots: Arc::new(roots),
+            inspect,
+            audit,
+            detector,
+            prompter,
         })))
     }
 
@@ -113,10 +173,11 @@ impl Broker {
         &self.ca_cert_pem
     }
 
-    /// Is this host one we terminate (broker credentials for)?
-    pub fn brokers(&self, host: &str) -> bool {
+    /// Should this host be TLS-terminated? True in inspection mode (every
+    /// host) or for a credential host.
+    pub fn should_terminate(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
-        self.creds.iter().any(|c| c.matches(&host))
+        self.inspect || self.creds.iter().any(|c| c.matches(&host))
     }
 
     fn credential_for(&self, host: &str) -> Option<&Credential> {
@@ -177,8 +238,86 @@ impl Broker {
         let mut upstream = StreamOwned::new(up_conn, up_tcp);
 
         let header = self.credential_for(host).map(|c| c.header_for(host));
-        relay_http(&mut client, &mut upstream, header.as_deref())
+
+        // Leak detection: for hosts that are not code-expected, scan the
+        // outbound body; a detected leak is blocked (the request is not
+        // forwarded) and alerted.
+        let scan = self.detector.is_some()
+            && !CODE_EXPECTED
+                .iter()
+                .any(|h| *h == host.to_ascii_lowercase());
+        let closure = |body: &[u8]| self.check_leak(host, body);
+        let inspector: Option<Inspector> = if scan { Some(&closure) } else { None };
+
+        let info = relay_http(&mut client, &mut upstream, header.as_deref(), inspector)?;
+        self.write_audit(host, &info);
+        Ok(())
     }
+
+    /// Scans one outbound body for project content. Returns whether to proceed
+    /// (true) or block (false). A leak is alerted (audit log + notification).
+    fn check_leak(&self, host: &str, body: &[u8]) -> bool {
+        let Some(det) = &self.detector else {
+            return true;
+        };
+        let Some(leak) = det.scan(body) else {
+            return true;
+        };
+        let what = if leak.kind == "honeytoken" {
+            format!("honeytoken {:?}", leak.detail)
+        } else {
+            format!("code from {} ({} fragments)", leak.detail, leak.score)
+        };
+        // With an inline prompter (--ask), let the user decide per leak;
+        // otherwise fail safe and block. Default (timeout/no answer) is block.
+        let allowed = match &self.prompter {
+            Some(p) => p.ask_leak(&what, host),
+            None => false,
+        };
+        let verdict = if allowed {
+            "LEAK ALLOWED"
+        } else {
+            "LEAK BLOCKED"
+        };
+        let msg = format!("{verdict}: {what} -> {host}");
+        if let Some(lock) = &self.audit {
+            if let Ok(mut f) = lock.lock() {
+                let ts = now_secs();
+                writeln!(f, "[{ts}] !!! {msg} (body {}B)", body.len()).ok();
+            }
+        }
+        if !allowed {
+            crate::proxy::desktop_notify(&format!("claude-island: {msg}"));
+        }
+        allowed
+    }
+
+    /// Appends one outbound request to the audit log: destination, method,
+    /// path, body size, and a truncated body preview. Serialized by a mutex
+    /// so concurrent threads do not interleave. Authorization is never logged.
+    fn write_audit(&self, host: &str, info: &RequestInfo) {
+        let Some(lock) = &self.audit else { return };
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut f) = lock.lock() {
+            writeln!(
+                f,
+                "[{ts}] {host} {} {} body={}B preview={:?}",
+                info.method, info.path, info.body_len, info.preview
+            )
+            .ok();
+        }
+    }
+}
+
+/// A summary of one outbound request, for the audit log.
+struct RequestInfo {
+    method: String,
+    path: String,
+    body_len: usize,
+    preview: String,
 }
 
 impl Credential {
@@ -206,18 +345,25 @@ fn relay_http<C: Read + Write, U: Read + Write>(
     client: &mut C,
     upstream: &mut U,
     inject_header: Option<&str>,
-) -> Result<(), String> {
+    inspect: Option<Inspector>,
+) -> Result<RequestInfo, String> {
     let (head, mut leftover) = read_headers(client)?;
     let mut lines: Vec<String> = head.split("\r\n").map(|s| s.to_string()).collect();
 
-    // Drop any client Authorization (the sandbox only ever has a placeholder
-    // or none) and the Connection headers, then inject the real credential
-    // and force Connection: close.
+    // Request line summary (method + path), for the audit log.
+    let request_line = lines.first().cloned().unwrap_or_default();
+    let mut rl = request_line.split_whitespace();
+    let method = rl.next().unwrap_or("").to_string();
+    let path = rl.next().unwrap_or("").to_string();
+
+    // Strip Authorization ONLY when we will inject our own credential (a
+    // credential host); otherwise pass the client's auth through unchanged
+    // (inspection must not break the tool's own authentication). Always drop
+    // the Connection headers and force Connection: close.
     lines.retain(|l| {
         let lower = l.to_ascii_lowercase();
-        !lower.starts_with("authorization:")
-            && !lower.starts_with("connection:")
-            && !lower.starts_with("proxy-connection:")
+        let strip_auth = inject_header.is_some() && lower.starts_with("authorization:");
+        !strip_auth && !lower.starts_with("connection:") && !lower.starts_with("proxy-connection:")
     });
     if let Some(h) = inject_header {
         lines.insert(1, format!("Authorization: {h}"));
@@ -231,12 +377,44 @@ fn relay_http<C: Read + Write, U: Read + Write>(
         .unwrap_or(false);
 
     let request = format!("{}\r\n\r\n", lines.join("\r\n"));
+
+    // If inspecting AND the body fits, buffer it fully so it can be scanned
+    // before anything is sent upstream (so a leak can be blocked cleanly).
+    let buffered = if inspect.is_some() {
+        buffer_body(client, &mut leftover, content_length, chunked, SCAN_CAP)?
+    } else {
+        None
+    };
+
+    let body_len = buffered
+        .as_ref()
+        .map(|b| b.len())
+        .unwrap_or_else(|| content_length.unwrap_or(leftover.len()));
+    let preview_src = buffered.as_deref().unwrap_or(&leftover);
+    let preview_len = preview_src.len().min(400);
+    let preview = String::from_utf8_lossy(&preview_src[..preview_len]).into_owned();
+
+    if let (Some(check), Some(body)) = (inspect, &buffered) {
+        if !check(body) {
+            // Blocked: tell the client and never touch the real host.
+            write_error(client, "403 Forbidden (claude-island: leak blocked)");
+            return Ok(RequestInfo {
+                method,
+                path,
+                body_len,
+                preview,
+            });
+        }
+    }
+
     upstream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write request: {e}"))?;
 
-    // Forward the request body.
-    if let Some(len) = content_length {
+    // Forward the request body: the buffered copy if we have it, else stream.
+    if let Some(body) = &buffered {
+        upstream.write_all(body).map_err(|e| format!("body: {e}"))?;
+    } else if let Some(len) = content_length {
         forward_n(client, upstream, &mut leftover, len)?;
     } else if chunked {
         forward_chunked(client, upstream, &mut leftover)?;
@@ -259,7 +437,12 @@ fn relay_http<C: Read + Write, U: Read + Write>(
         }
     }
     client.flush().ok();
-    Ok(())
+    Ok(RequestInfo {
+        method,
+        path,
+        body_len,
+        preview,
+    })
 }
 
 /// Reads up to the end of HTTP headers; returns (headers-without-crlfcrlf,
@@ -291,6 +474,66 @@ fn header_value(lines: &[String], name: &str) -> Option<String> {
         let (k, v) = l.split_once(':')?;
         (k.trim().eq_ignore_ascii_case(name)).then(|| v.trim().to_string())
     })
+}
+
+/// Sends a minimal HTTP error response to the client (used to block a leak).
+fn write_error<C: Write>(client: &mut C, status: &str) {
+    client
+        .write_all(
+            format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok();
+    client.flush().ok();
+}
+
+/// Reads the full request body into memory for scanning, using `leftover`
+/// first. Returns None if the body is larger than `cap` (caller then streams
+/// it unscanned). A body-less request yields an empty buffer.
+fn buffer_body<C: Read>(
+    client: &mut C,
+    leftover: &mut Vec<u8>,
+    content_length: Option<usize>,
+    chunked: bool,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    if let Some(len) = content_length {
+        if len > cap {
+            return Ok(None);
+        }
+        let mut buf = std::mem::take(leftover);
+        buf.truncate(len);
+        let mut tmp = [0u8; 16384];
+        while buf.len() < len {
+            let n = client
+                .read(&mut tmp)
+                .map_err(|e| format!("body read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            let want = (len - buf.len()).min(n);
+            buf.extend_from_slice(&tmp[..want]);
+        }
+        Ok(Some(buf))
+    } else if chunked {
+        let mut buf = std::mem::take(leftover);
+        let mut tmp = [0u8; 16384];
+        while find_subslice(&buf, b"0\r\n\r\n").is_none() {
+            if buf.len() > cap {
+                return Ok(None);
+            }
+            let n = client
+                .read(&mut tmp)
+                .map_err(|e| format!("chunk read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        Ok(Some(buf))
+    } else {
+        Ok(Some(std::mem::take(leftover)))
+    }
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {

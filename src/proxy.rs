@@ -172,14 +172,21 @@ impl State {
 ///   3. tmux status line if inside tmux,
 ///   4. nothing.
 fn notify(host: &str) {
-    let msg = format!("claude-island: blocked {host} (approve: claude-island approve {host})");
+    desktop_notify(&format!(
+        "claude-island: blocked {host} (approve: claude-island approve {host})"
+    ));
+}
+
+/// Best-effort desktop notification (user hook, else notify-send, else tmux),
+/// none of which touch the agent's terminal. All optional.
+pub fn desktop_notify(msg: &str) {
     if let Ok(hook) = std::env::var("CLAUDE_ISLAND_NOTIFY") {
         if !hook.trim().is_empty() {
             Command::new("sh")
                 .arg("-c")
                 .arg(&hook)
                 .arg("--")
-                .arg(&msg)
+                .arg(msg)
                 .spawn()
                 .ok();
             return;
@@ -187,7 +194,7 @@ fn notify(host: &str) {
     }
     if Command::new("notify-send")
         .arg("claude-island")
-        .arg(&msg)
+        .arg(msg)
         .spawn()
         .is_ok()
     {
@@ -196,7 +203,7 @@ fn notify(host: &str) {
     if std::env::var("TMUX").is_ok() {
         Command::new("tmux")
             .arg("display-message")
-            .arg(&msg)
+            .arg(msg)
             .status()
             .ok();
     }
@@ -335,7 +342,7 @@ fn handle(mut client: TcpStream, state: &State) {
     // tunnel. Only over 443.
     if port == 443 {
         if let Some(broker) = &state.broker {
-            if broker.brokers(host) {
+            if broker.should_terminate(host) {
                 let host = host.to_string();
                 client.set_read_timeout(None).ok();
                 if client

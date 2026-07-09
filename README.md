@@ -319,6 +319,62 @@ fresh, fully verified TLS connection to the real host. So:
 Verify with `~/.cache/claude-island/proxy.log` (`brokered: ...` lines). Only
 GitHub is brokered for now.
 
+## Leak inspection and detection: `--inspect` and `--detect`
+
+The same TLS termination that powers the broker can look at **everything**
+leaving the sandbox, in plaintext, to answer a concrete question: is my local
+code being sent somewhere it should not?
+
+### `--inspect`: total transparency
+
+`--inspect` (implies `--proxy`) TLS-terminates **every** host and records each
+outbound request to `~/.cache/claude-island/outbound-audit.log`: destination,
+method, path, body size, and a truncated body preview. The Authorization
+header is never logged. The log is appended across sessions (a
+`=== session start ===` marker delimits them) so the history is kept.
+
+```sh
+claude-island --inspect
+# in another terminal:
+tail -f ~/.cache/claude-island/outbound-audit.log
+```
+
+You see exactly what each request carries and where it goes, including
+`api.anthropic.com` and any third-party endpoint a tool contacts. Claude Code
+itself keeps working through the interception (its own `Authorization` is
+passed through untouched). Caveat: a tool that pins certificates or insists on
+HTTP/2 may break under `--inspect`; such a tool is the exception.
+
+### `--detect`: block outbound copies of your code
+
+`--detect` (implies `--inspect`) indexes the project's files at startup into
+content fingerprints (sampled k-grams, robust to reformatting), optionally
+augmented by honeytokens from `~/.config/claude-island/honeytokens` (one
+string per line). It then scans every outbound body to a **non-Anthropic**
+host; if a chunk of your local code (or a honeytoken) appears, the request is
+**blocked** with `403` and an alert is written to the audit log:
+
+```
+[1783590111] !!! LEAK BLOCKED: code from src/algo.rs (6 fragments) -> example.com (body 82B)
+```
+
+The Anthropic API is audited but never flagged: it legitimately carries your
+code (that is how Claude Code works), so alarming on it would be noise. The
+signal is code leaving to **anywhere else**. Bodies larger than 8 MB stream
+unscanned (source files are small, so this misses little), and detection is
+heuristic: a compressed or re-encoded body can evade the fingerprints.
+
+Combine with `--ask` (in a terminal) to decide **per leak** instead of
+blocking outright: a red inline prompt shows what is leaving and where, and
+the request is held until you answer (default, and on timeout, is to block):
+
+```
+▌ claude-island  allow LEAK of code from src/algo.rs to example.com ?  [y/N]
+```
+
+Without a terminal (or without `--ask`), a detected leak is blocked
+automatically and recorded as `!!! LEAK BLOCKED` in the audit log.
+
 ## Code review mode: `--ro` and `--noexec`
 
 For unknown repositories (unaudited code, possible prompt injection in the

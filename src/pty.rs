@@ -25,13 +25,19 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
-/// A pending approval question from the proxy to the pump.
+/// A pending approval question from the proxy/broker to the pump.
 pub struct Request {
-    pub domain: String,
+    /// The full question shown in the prompt (may contain SGR colors); the
+    /// pump appends ` ?  [y/N]`.
+    pub question: String,
+    /// Short text echoed in the confirmation line.
+    pub label: String,
+    /// Draw the bar in red (a security alert, e.g. a leak) rather than blue.
+    pub alert: bool,
     pub reply: Sender<bool>,
 }
 
-/// Handle given to the proxy to ask the pump a question (blocking).
+/// Handle given to the proxy/broker to ask the pump a question (blocking).
 #[derive(Clone)]
 pub struct Prompter {
     tx: Sender<Request>,
@@ -43,11 +49,31 @@ impl Prompter {
     /// answered; defaults to deny after a timeout so a stuck connection does
     /// not hang forever.
     pub fn ask(&self, domain: &str) -> bool {
+        self.ask_question(
+            format!("allow network to \x1b[1;97m{domain}\x1b[0m"),
+            domain.to_string(),
+            false,
+        )
+    }
+
+    /// Asks whether to allow a detected leak (`what` heading to `host`).
+    /// Defaults to deny (block the leak) on timeout.
+    pub fn ask_leak(&self, what: &str, host: &str) -> bool {
+        self.ask_question(
+            format!("allow LEAK of \x1b[1;97m{what}\x1b[0m to \x1b[1;97m{host}\x1b[0m"),
+            format!("{what} -> {host}"),
+            true,
+        )
+    }
+
+    fn ask_question(&self, question: String, label: String, alert: bool) -> bool {
         let (rtx, rrx) = std::sync::mpsc::channel();
         if self
             .tx
             .send(Request {
-                domain: domain.to_string(),
+                question,
+                label,
+                alert,
                 reply: rtx,
             })
             .is_err()
@@ -237,13 +263,18 @@ pub fn run(
                 unsafe {
                     libc::tcflush(0, libc::TCIFLUSH);
                 }
-                // A distinct line drawn over the agent's TUI: light-blue bar
-                // and name, bright domain, clear [y/N]. \x1b[2K erases the
-                // line first so no leftover from the TUI overlaps it.
+                // A distinct line drawn over the agent's TUI: a colored bar
+                // and name (red for a security alert, else light blue), the
+                // question, clear [y/N]. \x1b[2K erases the line first so no
+                // leftover from the TUI overlaps it.
+                let bar = if req.alert {
+                    "\x1b[1;91m"
+                } else {
+                    "\x1b[1;94m"
+                };
                 let prompt = format!(
-                    "\r\n\x1b[2K\x1b[1;94m\u{258c} claude-island\x1b[0m  allow network to \
-                     \x1b[1;97m{}\x1b[0m ?  \x1b[1;94m[y/N]\x1b[0m ",
-                    req.domain
+                    "\r\n\x1b[2K{bar}\u{258c} claude-island\x1b[0m  {} ?  {bar}[y/N]\x1b[0m ",
+                    req.question
                 );
                 stdout.write_all(prompt.as_bytes()).ok();
                 stdout.flush().ok();
@@ -322,12 +353,12 @@ pub fn run(
                         let echo = if answer {
                             format!(
                                 "\r\x1b[2K\x1b[1;92m\u{258c} allowed\x1b[0m {}\r\n",
-                                req.domain
+                                req.label
                             )
                         } else {
                             format!(
                                 "\r\x1b[2K\x1b[1;91m\u{258c} denied\x1b[0m {}\r\n",
-                                req.domain
+                                req.label
                             )
                         };
                         stdout.write_all(echo.as_bytes()).ok();

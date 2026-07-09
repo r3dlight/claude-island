@@ -11,6 +11,7 @@
 mod broker;
 mod canary;
 mod denials;
+mod detect;
 mod envs;
 mod explain;
 mod profile;
@@ -118,6 +119,14 @@ Options:
   --broker         implies --proxy; make gh/git work against GitHub without
                    the token entering the sandbox (TLS-terminating broker
                    using GITHUB_TOKEN/GH_TOKEN from your environment)
+  --inspect        implies --proxy; TLS-terminate EVERY host and record every
+                   outbound request (method, host, path, body preview) to
+                   ~/.cache/claude-island/outbound-audit.log (leak detection).
+                   May break tools that pin certs or require HTTP/2
+  --detect         implies --inspect; fingerprint the project's files (plus
+                   honeytokens from ~/.config/claude-island/honeytokens) and
+                   BLOCK any outbound request (to a non-Anthropic host) that
+                   carries your local code, with an alert in the audit log
   --allow DOMAIN   add a domain to the proxy allowlist (repeatable)
   --serve          allow TCP bind on 3000, 4321, 5173, 8000, 8080
   --ports P1,P2    additional bind ports
@@ -145,6 +154,8 @@ struct Opts {
     proxy: bool,
     ask: bool,
     broker: bool,
+    inspect: bool,
+    detect: bool,
     serve: bool,
     ports: Vec<u16>,
     allow: Vec<String>,
@@ -190,6 +201,15 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
             "--broker" => {
                 o.proxy = true;
                 o.broker = true;
+            }
+            "--inspect" => {
+                o.proxy = true;
+                o.inspect = true;
+            }
+            "--detect" => {
+                o.proxy = true;
+                o.inspect = true;
+                o.detect = true;
             }
             "--serve" => o.serve = true,
             "--dry-run" => o.dry_run = true,
@@ -464,6 +484,7 @@ fn setup_network(
     o: &Opts,
     sel: &[&envs::EnvSpec],
     home: &std::path::Path,
+    project: &std::path::Path,
     interactive: bool,
     prompter: Option<pty::Prompter>,
 ) -> Result<NetSetup> {
@@ -478,7 +499,7 @@ fn setup_network(
     let fixed = fixed_domains(sel, &o.allow);
     let log = home.join(".cache/claude-island/proxy.log");
     let inline = prompter.is_some();
-    let bs = build_broker(o, home)?;
+    let bs = build_broker(o, home, project, prompter.clone())?;
     let p = proxy::start(
         fixed,
         allow_file(home),
@@ -534,38 +555,85 @@ struct BrokerSetup {
     reads: Vec<String>,
 }
 
-/// Builds the GitHub credential broker when `--broker` is set and a token is
-/// available in the wrapper environment.
-fn build_broker(o: &Opts, home: &std::path::Path) -> Result<BrokerSetup> {
-    if !o.broker {
+/// Builds the credential/inspection broker. `--broker` adds the GitHub
+/// credential (from the wrapper's GITHUB_TOKEN/GH_TOKEN); `--inspect`
+/// terminates every host and audits outbound requests.
+fn build_broker(
+    o: &Opts,
+    home: &std::path::Path,
+    project: &std::path::Path,
+    prompter: Option<pty::Prompter>,
+) -> Result<BrokerSetup> {
+    if !o.broker && !o.inspect {
         return Ok(BrokerSetup::default());
     }
-    let token = env::var("GITHUB_TOKEN")
-        .ok()
-        .or_else(|| env::var("GH_TOKEN").ok());
-    let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
-        eprintln!("claude-island: --broker: no GITHUB_TOKEN/GH_TOKEN in the environment, skipping");
-        return Ok(BrokerSetup::default());
+    // Leak detector: index the project + load honeytokens (--detect).
+    let detector = if o.detect {
+        let honeytokens = std::fs::read_to_string(home.join(".config/claude-island/honeytokens"))
+            .map(|c| {
+                c.lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        match detect::Detector::index(project, honeytokens) {
+            Some(d) => {
+                eprintln!(
+                    "claude-island: --detect: indexed {} project files for leak detection",
+                    d.files
+                );
+                Some(std::sync::Arc::new(d))
+            }
+            None => {
+                eprintln!("claude-island: --detect: nothing to index, detection inactive");
+                None
+            }
+        }
+    } else {
+        None
     };
-    let cred = broker::Credential {
-        hosts: [
-            "github.com",
-            "api.github.com",
-            "codeload.github.com",
-            "uploads.github.com",
-            "raw.githubusercontent.com",
-            "objects.githubusercontent.com",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
-        bearer_hosts: ["api.github.com", "uploads.github.com"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        token,
-    };
-    let Some(b) = broker::Broker::new(vec![cred])? else {
+    let mut creds = vec![];
+    if o.broker {
+        let token = env::var("GITHUB_TOKEN")
+            .ok()
+            .or_else(|| env::var("GH_TOKEN").ok());
+        match token.filter(|t| !t.trim().is_empty()) {
+            Some(token) => creds.push(broker::Credential {
+                hosts: [
+                    "github.com",
+                    "api.github.com",
+                    "codeload.github.com",
+                    "uploads.github.com",
+                    "raw.githubusercontent.com",
+                    "objects.githubusercontent.com",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+                bearer_hosts: ["api.github.com", "uploads.github.com"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                token,
+            }),
+            None => eprintln!(
+                "claude-island: --broker: no GITHUB_TOKEN/GH_TOKEN in the environment, skipping"
+            ),
+        }
+    }
+    // The audit log is APPENDED across sessions (a session marker delimits
+    // them) so leak forensics keep their history instead of being wiped.
+    let audit = o
+        .inspect
+        .then(|| home.join(".cache/claude-island/outbound-audit.log"));
+    if let Some(a) = &audit {
+        if let Some(parent) = a.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    let has_github = !creds.is_empty();
+    let Some(b) = broker::Broker::new(creds, o.inspect, audit.clone(), detector, prompter)? else {
         return Ok(BrokerSetup::default());
     };
 
@@ -604,13 +672,24 @@ fn build_broker(o: &Opts, home: &std::path::Path) -> Result<BrokerSetup> {
         envs.push((k.to_string(), bundle.clone()));
     }
     // gh only sends a request if it believes it is authenticated; give it a
-    // placeholder token that the broker replaces with the real one.
-    envs.push((
-        "GH_TOKEN".to_string(),
-        "brokered_by_claude_island".to_string(),
-    ));
+    // placeholder token that the broker replaces with the real one (only when
+    // we are actually brokering GitHub credentials).
+    if has_github {
+        envs.push((
+            "GH_TOKEN".to_string(),
+            "brokered_by_claude_island".to_string(),
+        ));
+    }
 
-    eprintln!("claude-island: --broker: GitHub credential broker active (token stays outside the sandbox)");
+    if o.broker {
+        eprintln!("claude-island: --broker: GitHub credential broker active (token stays outside the sandbox)");
+    }
+    if let Some(a) = &audit {
+        eprintln!(
+            "claude-island: --inspect: auditing outbound requests to {}",
+            a.display()
+        );
+    }
     Ok(BrokerSetup {
         broker: Some(b),
         env: envs,
@@ -846,7 +925,7 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         None
     };
     let prompter = pump.as_ref().map(|(p, _, _)| p.clone());
-    let net = setup_network(&o, &sel, &home, o.ask, prompter)?;
+    let net = setup_network(&o, &sel, &home, &project, o.ask, prompter)?;
 
     let mut serve_ports: Vec<u16> = vec![];
     if o.serve {
@@ -964,7 +1043,7 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     if !envs::has_cmd("island") {
         return Err("island not found in PATH: run ./install.sh first".into());
     }
-    let net = setup_network(&o, &sel, &home, false, None)?;
+    let net = setup_network(&o, &sel, &home, &project, false, None)?;
 
     // Canary artifacts, created BEFORE profile generation so the carve logic
     // (deny mode) enumerates and grants them: a dedicated dir holding the
@@ -1245,7 +1324,7 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         return Err("island not found in PATH: run ./install.sh first".into());
     }
     let sel = resolve_envs(&o, registry, &project, &home, true)?;
-    let net = setup_network(&o, &sel, &home, false, None)?;
+    let net = setup_network(&o, &sel, &home, &project, false, None)?;
     let mut serve_ports: Vec<u16> = vec![];
     if o.serve {
         serve_ports.extend_from_slice(DEV_SERVE_PORTS);
