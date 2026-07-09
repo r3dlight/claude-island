@@ -26,6 +26,9 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Unit tests (leak detection logic; the Landlock canaries are local)
+        run: cargo test --release
+
       - name: Validate embedded Landlock snippets (TOML)
         run: |
           python3 - <<'PY'
@@ -39,6 +42,15 @@ jobs:
                   bad += 1
           sys.exit(1 if bad else 0)
           PY
+
+      # Publish the release binary (built above) so a green run yields a
+      # downloadable, checked build.
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-island-linux-x86_64
+          path: target/release/claude-island
+          if-no-files-found: error
 
     # The Landlock canary suite (`claude-island check`) is a LOCAL test: it
     # needs Landlock ABI 6 (Linux 6.12+), which the GitHub runners predate.
