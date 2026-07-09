@@ -272,7 +272,9 @@ pub fn run_all(m: Modes) -> ExitCode {
             match File::create(project.join(".claude-island-canary-denied/planted")) {
                 Ok(_) => Fail("write GRANTED into a denied dir".into()),
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
-                Err(e) if e.kind() == ErrorKind::NotFound => Skip("synthetic denied dir absent".into()),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    Skip("synthetic denied dir absent".into())
+                }
                 Err(e) => Skip(format!("unexpected error: {e}")),
             },
         );

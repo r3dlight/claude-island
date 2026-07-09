@@ -59,7 +59,8 @@ impl Prompter {
         unsafe {
             libc::write(self.wake_w, byte.as_ptr() as *const libc::c_void, 1);
         }
-        rrx.recv_timeout(std::time::Duration::from_secs(120)).unwrap_or(false)
+        rrx.recv_timeout(std::time::Duration::from_secs(120))
+            .unwrap_or(false)
     }
 }
 
@@ -236,8 +237,12 @@ pub fn run(
                 unsafe {
                     libc::tcflush(0, libc::TCIFLUSH);
                 }
+                // A distinct line drawn over the agent's TUI: light-blue bar
+                // and name, bright domain, clear [y/N]. \x1b[2K erases the
+                // line first so no leftover from the TUI overlaps it.
                 let prompt = format!(
-                    "\r\n\x1b[1;33m[claude-island]\x1b[0m allow network to {} ? [y/N] ",
+                    "\r\n\x1b[2K\x1b[1;94m\u{258c} claude-island\x1b[0m  allow network to \
+                     \x1b[1;97m{}\x1b[0m ?  \x1b[1;94m[y/N]\x1b[0m ",
                     req.domain
                 );
                 let _ = stdout.write_all(prompt.as_bytes());
@@ -247,8 +252,16 @@ pub fn run(
         }
 
         let mut fds = [
-            libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: master_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_r,
+                events: libc::POLLIN,
+                revents: 0,
+            },
             libc::pollfd {
                 fd: if stdin_open { 0 } else { -1 },
                 events: libc::POLLIN,
@@ -303,12 +316,19 @@ pub fn run(
                 Ok(k) => {
                     if let Some(req) = asking.take() {
                         let answer = buf[..k].iter().any(|&b| b == b'y' || b == b'Y');
-                        // Leave a visible, colored confirmation line so the
-                        // decision is not erased by the agent's next redraw.
+                        // Replace the prompt line in place (\r + erase) with a
+                        // colored confirmation so the decision stays visible
+                        // and is not lost under the agent's next redraw.
                         let echo = if answer {
-                            format!("\x1b[1;32m-> allowed {}\x1b[0m\r\n", req.domain)
+                            format!(
+                                "\r\x1b[2K\x1b[1;92m\u{258c} allowed\x1b[0m {}\r\n",
+                                req.domain
+                            )
                         } else {
-                            format!("\x1b[1;31m-> denied {}\x1b[0m\r\n", req.domain)
+                            format!(
+                                "\r\x1b[2K\x1b[1;91m\u{258c} denied\x1b[0m {}\r\n",
+                                req.domain
+                            )
                         };
                         let _ = stdout.write_all(echo.as_bytes());
                         let _ = req.reply.send(answer);

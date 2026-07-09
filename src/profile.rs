@@ -22,6 +22,47 @@ pub struct Profile {
     pub dir: PathBuf,
 }
 
+/// The project path recorded in a profile's 05-vars.toml, if any.
+fn profile_project(vars_toml: &str) -> Option<String> {
+    let mut in_project = false;
+    for line in vars_toml.lines() {
+        let t = line.trim();
+        if t == "name = \"project\"" {
+            in_project = true;
+        } else if in_project && t.starts_with("literal") {
+            // literal = ["/path"]
+            let start = t.find('"')? + 1;
+            let rest = &t[start..];
+            return Some(rest[..rest.find('"')?].to_string());
+        }
+    }
+    None
+}
+
+/// Removes claude-island profiles whose project directory no longer exists,
+/// so Island stops warning about stale contexts at every launch. Only touches
+/// `claude-*` profiles (never other Island profiles the user may have).
+pub fn prune_stale(home: &Path) {
+    let dir = home.join(".config/island/profiles");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("claude-") {
+            continue;
+        }
+        let vars = entry.path().join("landlock/05-vars.toml");
+        let Ok(content) = fs::read_to_string(&vars) else {
+            continue;
+        };
+        if let Some(project) = profile_project(&content) {
+            if !Path::new(&project).exists() {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
 /// FNV-1a 64 folded to 32 bits: stable profile name for a given path.
 fn hash8(s: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -136,6 +177,10 @@ pub fn generate(
     for d in [".claude", ".cache/claude", ".cache/claude-cli-nodejs"] {
         fs::create_dir_all(home.join(d))?;
     }
+
+    // Drop profiles left behind by deleted projects (silences Island's
+    // stale-context warnings, which would otherwise accumulate).
+    prune_stale(home);
 
     let name = name_for(project, envs, ro, noexec, !deny.is_empty());
     let dir = home.join(".config/island/profiles").join(&name);

@@ -72,7 +72,10 @@ fn parse_port_array(v: &str, line: usize) -> Result<Vec<u16>, String> {
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse::<u16>().map_err(|_| format!("line {line}: invalid port: {s}")))
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|_| format!("line {line}: invalid port: {s}"))
+        })
         .collect()
 }
 
@@ -134,7 +137,9 @@ fn approvals(home: &Path) -> Vec<(String, String)> {
 pub fn is_approved(home: &Path, project: &Path, content: &str) -> bool {
     let hash = content_hash(content);
     let project = project.to_string_lossy();
-    approvals(home).iter().any(|(h, p)| *h == hash && *p == project)
+    approvals(home)
+        .iter()
+        .any(|(h, p)| *h == hash && *p == project)
 }
 
 /// Records (or replaces) the approval for this project.

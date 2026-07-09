@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 Stephane N
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Validate embedded Landlock snippets (TOML)
+        run: |
+          python3 - <<'PY'
+          import glob, tomllib, sys
+          bad = 0
+          for f in sorted(glob.glob("snippets/*.toml")):
+              try:
+                  tomllib.load(open(f, "rb"))
+              except Exception as e:
+                  print(f"invalid TOML: {f}: {e}")
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+    # The Landlock canary suite (`claude-island check`) is a LOCAL test: it
+    # needs Landlock ABI 6 (Linux 6.12+), which the GitHub runners predate.

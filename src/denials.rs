@@ -120,7 +120,9 @@ pub fn parse(strace_output: &str) -> Vec<Denial> {
         };
 
         // Syscall name: the identifier just before the first '('.
-        let Some(paren) = line.find('(') else { continue };
+        let Some(paren) = line.find('(') else {
+            continue;
+        };
         let before = &line[..paren];
         let syscall = before
             .rsplit(|c: char| c.is_whitespace())
@@ -150,9 +152,11 @@ pub fn parse(strace_output: &str) -> Vec<Denial> {
             },
         };
 
-        let entry = map
-            .entry((kind.clone(), target.clone()))
-            .or_insert((syscall.clone(), errno.to_string(), 0));
+        let entry = map.entry((kind.clone(), target.clone())).or_insert((
+            syscall.clone(),
+            errno.to_string(),
+            0,
+        ));
         entry.2 += 1;
     }
 

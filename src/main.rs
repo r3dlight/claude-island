@@ -90,6 +90,7 @@ Usage:
   claude-island watch                  live-approve domains blocked by --ask
   claude-island approve [DOMAIN...]    approve blocked domains (--all for every
                                        pending one); no args lists them
+  claude-island completion SHELL       print a completion script (bash/zsh/fish)
   claude-island --list                 list available environments
 
 Options:
@@ -204,7 +205,9 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
             }
             "--deny" => {
                 i += 1;
-                let v = args.get(i).ok_or("--deny expects a project top-level name")?;
+                let v = args
+                    .get(i)
+                    .ok_or("--deny expects a project top-level name")?;
                 o.deny.push(v.clone());
             }
             "--list" => return Ok(Parsed::List),
@@ -506,13 +509,88 @@ fn setup_network(
     })
 }
 
+const BASH_COMPLETION: &str = r#"_claude_island() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    COMPREPLY=( $(compgen -W "@WORDS@" -- "$cur") )
+}
+complete -F _claude_island claude-island
+"#;
+
+const ZSH_COMPLETION: &str = r#"#compdef claude-island
+_claude_island() {
+    local -a words
+    words=(@WORDS@)
+    compadd -- $words
+}
+compdef _claude_island claude-island
+"#;
+
+/// `completion <shell>`: prints a completion script (bash, zsh, fish) with
+/// the current subcommands, flags and environment names baked in.
+fn cmd_completion(shell: Option<&String>, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
+    let shell = shell.ok_or("completion needs a shell: bash, zsh or fish")?;
+    let mut all: Vec<String> = [
+        "check",
+        "update",
+        "explain",
+        "denials",
+        "allow",
+        "watch",
+        "approve",
+        "completion",
+        "--auto",
+        "--ro",
+        "--noexec",
+        "--deny",
+        "--proxy",
+        "--ask",
+        "--allow",
+        "--serve",
+        "--ports",
+        "--mem",
+        "--tasks",
+        "--dry-run",
+        "--json",
+        "--list",
+        "--help",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for e in registry {
+        all.push(format!("--{}", e.name));
+        for a in e.aliases {
+            all.push(format!("--{a}"));
+        }
+    }
+    let words = all.join(" ");
+    let script = match shell.as_str() {
+        "bash" => BASH_COMPLETION.replace("@WORDS@", &words),
+        "zsh" => ZSH_COMPLETION.replace("@WORDS@", &words),
+        "fish" => {
+            let mut out = String::from("complete -c claude-island -f\n");
+            for w in &all {
+                out.push_str(&format!("complete -c claude-island -a '{w}'\n"));
+            }
+            out
+        }
+        other => return Err(format!("unsupported shell: {other} (bash, zsh, fish)")),
+    };
+    print!("{script}");
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Reads one trimmed line from stdin after printing a prompt.
 fn prompt_line(msg: &str) -> Result<String> {
     use std::io::Write;
     print!("{msg}");
     std::io::stdout().flush().ok();
     let mut s = String::new();
-    if std::io::stdin().read_line(&mut s).map_err(|e| format!("read: {e}"))? == 0 {
+    if std::io::stdin()
+        .read_line(&mut s)
+        .map_err(|e| format!("read: {e}"))?
+        == 0
+    {
         return Err("aborted".into()); // EOF
     }
     Ok(s.trim().to_string())
@@ -585,7 +663,10 @@ fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         .collect();
     if !candidates.is_empty()
         && ask_yesno(
-            &format!("\nhide {} from the agent (contents unreadable)?", candidates.join(", ")),
+            &format!(
+                "\nhide {} from the agent (contents unreadable)?",
+                candidates.join(", ")
+            ),
             false,
         )?
     {
@@ -627,7 +708,11 @@ fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     }
     println!(
         "\nlaunching: claude-island {}",
-        if feats.is_empty() { "(base sandbox)".into() } else { feats.join(" ") }
+        if feats.is_empty() {
+            "(base sandbox)".into()
+        } else {
+            feats.join(" ")
+        }
     );
     if !ask_yesno("proceed?", true)? {
         println!("cancelled");
@@ -751,7 +836,11 @@ fn launch_argv(prof_name: &str, rest: &[String], mem: &str, tasks: &str) -> Vec<
         argv.push(format!("TasksMax={tasks}"));
     }
     let program = env::var("CLAUDE_ISLAND_EXEC").unwrap_or_else(|_| "claude".into());
-    argv.extend(["island", "run", "-p", prof_name, "--"].iter().map(|s| s.to_string()));
+    argv.extend(
+        ["island", "run", "-p", prof_name, "--"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
     argv.push(program);
     argv.extend(rest.iter().cloned());
     argv
@@ -773,8 +862,7 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     // deny mode, a synthetic denied dir with a secret to prove carving hides
     // it. Cleaned up afterwards.
     let canary_dir = project.join(".claude-island-canary-dir");
-    std::fs::create_dir_all(&canary_dir)
-        .map_err(|e| format!("creating canary dir: {e}"))?;
+    std::fs::create_dir_all(&canary_dir).map_err(|e| format!("creating canary dir: {e}"))?;
     std::fs::copy("/usr/bin/true", canary_dir.join("exec"))
         .map_err(|e| format!("exec probe copy: {e}"))?;
 
@@ -976,7 +1064,11 @@ fn cmd_allow(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
             .ok_or_else(|| format!("{}: unknown environment: {n}", path.display()))?;
     }
     project_config::approve(&home, &project, &content)?;
-    println!("approved {} for {}", project_config::FILE_NAME, project.display());
+    println!(
+        "approved {} for {}",
+        project_config::FILE_NAME,
+        project.display()
+    );
     println!("  {}", project_config::summary(&cfg));
     println!("any change to the file will require a new `claude-island allow`");
     Ok(ExitCode::SUCCESS)
@@ -984,20 +1076,41 @@ fn cmd_allow(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
 /// A one-line suggestion for how to lift a filesystem denial, using the
 /// environment registry to map known toolchain dirs to their --flag.
-fn suggest_fs(target: &str, kind: &str, home: &std::path::Path, registry: &[envs::EnvSpec]) -> String {
+fn suggest_fs(
+    target: &str,
+    kind: &str,
+    home: &std::path::Path,
+    registry: &[envs::EnvSpec],
+) -> String {
     let home_s = home.to_string_lossy();
     // Under a known environment directory? Suggest the flag.
-    if let Some(rel) = target.strip_prefix(&*home_s).and_then(|r| r.strip_prefix('/')) {
+    if let Some(rel) = target
+        .strip_prefix(&*home_s)
+        .and_then(|r| r.strip_prefix('/'))
+    {
         for e in registry {
-            if e.dirs.iter().chain(e.create.iter()).any(|d| rel == *d || rel.starts_with(&format!("{d}/"))) {
+            if e.dirs
+                .iter()
+                .chain(e.create.iter())
+                .any(|d| rel == *d || rel.starts_with(&format!("{d}/")))
+            {
                 return format!("run with --{} to grant it", e.name);
             }
         }
     }
     // Otherwise suggest a snippet rule on the parent directory.
     let parent = target.rsplit_once('/').map(|(p, _)| p).unwrap_or(target);
-    let display = parent.strip_prefix(&*home_s).map(|r| format!("~{r}")).unwrap_or_else(|| parent.to_string());
-    let access = if kind == "exec" { "read + exec" } else if kind == "write" { "rw" } else { "read" };
+    let display = parent
+        .strip_prefix(&*home_s)
+        .map(|r| format!("~{r}"))
+        .unwrap_or_else(|| parent.to_string());
+    let access = if kind == "exec" {
+        "read + exec"
+    } else if kind == "write" {
+        "rw"
+    } else {
+        "read"
+    };
     format!("add a snippet granting {access} on {display}")
 }
 
@@ -1008,10 +1121,14 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let o = apply_project_config(o, &home, &project, registry, false)?;
     validate_deny(&o.deny)?;
     if o.rest.is_empty() {
-        return Err("denials requires a command: claude-island denials [flags] -- <command>".into());
+        return Err(
+            "denials requires a command: claude-island denials [flags] -- <command>".into(),
+        );
     }
     if !envs::has_cmd("strace") {
-        return Err("strace not found in PATH: install it (the kernel audit path needs root)".into());
+        return Err(
+            "strace not found in PATH: install it (the kernel audit path needs root)".into(),
+        );
     }
     if !envs::has_cmd("island") {
         return Err("island not found in PATH: run ./install.sh first".into());
@@ -1024,8 +1141,15 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     }
     serve_ports.extend(&o.ports);
     let prof = profile::generate(
-        &home, &project, &sel, o.ro, o.noexec, &o.deny, &serve_ports,
-        &net.connect_ports, &net.extra_env,
+        &home,
+        &project,
+        &sel,
+        o.ro,
+        o.noexec,
+        &o.deny,
+        &serve_ports,
+        &net.connect_ports,
+        &net.extra_env,
     )
     .map_err(|e| format!("profile generation: {e}"))?;
 
@@ -1036,14 +1160,20 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
     // strace traces from OUTSIDE the sandbox (it is the ancestor of the
     // process tree); island applies Landlock then execs the command.
-    eprintln!("claude-island: tracing `{}` in sandbox \"{}\"", o.rest.join(" "), prof.name);
+    eprintln!(
+        "claude-island: tracing `{}` in sandbox \"{}\"",
+        o.rest.join(" "),
+        prof.name
+    );
     let mut cmd = Command::new("strace");
     cmd.args(["-f", "-Z", "-y", "-qq", "-e", "trace=%file,%network", "-o"])
         .arg(&log)
         .args(["island", "run", "-p", &prof.name, "--"])
         .args(&o.rest);
     scrub_env(&mut cmd);
-    let _ = cmd.status().map_err(|e| format!("failed to run strace: {e}"))?;
+    let _ = cmd
+        .status()
+        .map_err(|e| format!("failed to run strace: {e}"))?;
 
     let output = std::fs::read_to_string(&log).map_err(|e| format!("reading strace log: {e}"))?;
     let _ = std::fs::remove_file(&log);
@@ -1062,9 +1192,15 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     }
     println!("{} distinct denial(s):", found.len());
     for d in &found {
-        let display = d.target.strip_prefix(&*home.to_string_lossy())
-            .map(|r| format!("~{r}")).unwrap_or_else(|| d.target.clone());
-        println!("  {:<7} {:<48} ({} {}) x{}", d.kind, display, d.syscall, d.errno, d.count);
+        let display = d
+            .target
+            .strip_prefix(&*home.to_string_lossy())
+            .map(|r| format!("~{r}"))
+            .unwrap_or_else(|| d.target.clone());
+        println!(
+            "  {:<7} {:<48} ({} {}) x{}",
+            d.kind, display, d.syscall, d.errno, d.count
+        );
         let hint = match d.kind.as_str() {
             "connect" | "bind" => {
                 let port = d.target.rsplit_once(':').map(|(_, p)| p).unwrap_or("?");
@@ -1099,7 +1235,8 @@ fn approve_domains(home: &std::path::Path, domains: &[String]) -> Result<Vec<Str
     }
     if !added.is_empty() {
         if let Some(parent) = af.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         current.sort();
         current.dedup();
@@ -1123,7 +1260,11 @@ fn cmd_approve(args: &[String]) -> Result<ExitCode> {
     let pending = proxy::read_domains_file(&pending_file(&home));
 
     let all = args.iter().any(|a| a == "--all");
-    let named: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
+    let named: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
 
     if !all && named.is_empty() {
         if pending.is_empty() {
@@ -1178,7 +1319,11 @@ fn cmd_watch() -> Result<ExitCode> {
                     let added = approve_domains(&home, std::slice::from_ref(&d))?;
                     println!(
                         "  {} {d}",
-                        if added.is_empty() { "already allowed:" } else { "approved:" }
+                        if added.is_empty() {
+                            "already allowed:"
+                        } else {
+                            "approved:"
+                        }
                     );
                     handled.insert(d);
                 }
@@ -1285,6 +1430,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         Some("update") => cmd_update(),
         Some("watch") => cmd_watch(),
         Some("approve") => cmd_approve(&args[1..]),
+        Some("completion") => cmd_completion(args.get(1), &envs::registry()),
         Some("denials") => {
             let registry = envs::registry();
             match parse(&args[1..], &registry)? {
@@ -1336,10 +1482,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
             // No arguments in a real terminal: run the interactive setup,
             // unless disabled. Non-interactive (piped/cron) keeps the plain
             // base-sandbox behavior.
-            if args.is_empty()
-                && pty::have_tty()
-                && env::var("CLAUDE_ISLAND_NO_WIZARD").is_err()
-            {
+            if args.is_empty() && pty::have_tty() && env::var("CLAUDE_ISLAND_NO_WIZARD").is_err() {
                 return cmd_wizard(&registry);
             }
             match parse(args, &registry)? {

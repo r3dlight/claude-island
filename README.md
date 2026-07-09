@@ -375,6 +375,13 @@ root or auditd to read, whereas strace traces our own process tree. Requires
 
 ## Good to know
 
+* Shell completion: `claude-island completion bash|zsh|fish` prints a script
+  (subcommands, flags, environment names). For bash:
+  `claude-island completion bash > ~/.local/share/bash-completion/completions/claude-island`;
+  for fish, write to `~/.config/fish/completions/claude-island.fish`; for zsh,
+  write `_claude-island` to a directory on your `$fpath`.
+* Profiles are named per project; those whose project directory was deleted
+  are pruned automatically on the next run (no stale-context warnings).
 * git works over HTTPS inside the sandbox; SSH push happens outside
   (`nosandbox git push` with the zsh hook). Neither keys nor agent are ever
   exposed.

@@ -186,7 +186,10 @@ fn notify(host: &str) {
         return;
     }
     if std::env::var("TMUX").is_ok() {
-        let _ = Command::new("tmux").arg("display-message").arg(&msg).status();
+        let _ = Command::new("tmux")
+            .arg("display-message")
+            .arg(&msg)
+            .status();
     }
 }
 
@@ -203,7 +206,10 @@ pub fn start(
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new().create(true).append(true).open(log_path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
     let log: Log = Arc::new(Mutex::new(Box::new(file)));
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
@@ -323,7 +329,10 @@ fn handle(mut client: TcpStream, state: &State) {
             tunnel(client, server);
         }
         Err(e) => {
-            log_line(&state.log, &format!("connection to {host}:{port} failed: {e}"));
+            log_line(
+                &state.log,
+                &format!("connection to {host}:{port} failed: {e}"),
+            );
             respond(&mut client, "502 Bad Gateway");
         }
     }
