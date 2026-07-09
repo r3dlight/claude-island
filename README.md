@@ -360,9 +360,11 @@ host; if a chunk of your local code (or a honeytoken) appears, the request is
 
 The Anthropic API is audited but never flagged: it legitimately carries your
 code (that is how Claude Code works), so alarming on it would be noise. The
-signal is code leaving to **anywhere else**. Bodies larger than 8 MB stream
-unscanned (source files are small, so this misses little), and detection is
-heuristic: a compressed or re-encoded body can evade the fingerprints.
+signal is code leaving to **anywhere else**. gzip- and zlib-compressed bodies
+are transparently decompressed before scanning, so compressed exfiltration is
+caught too. Bodies larger than 8 MB stream unscanned (source files are small,
+so this misses little), and detection stays heuristic: a bespoke encoding or
+encryption applied before sending can still evade the fingerprints.
 
 Combine with `--ask` (in a terminal) to decide **per leak** instead of
 blocking outright: a red inline prompt shows what is leaving and where, and

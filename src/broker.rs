@@ -263,10 +263,11 @@ impl Broker {
         let Some(leak) = det.scan(body) else {
             return true;
         };
+        let gz = if leak.compressed { ", gzip" } else { "" };
         let what = if leak.kind == "honeytoken" {
-            format!("honeytoken {:?}", leak.detail)
+            format!("honeytoken {:?}{gz}", leak.detail)
         } else {
-            format!("code from {} ({} fragments)", leak.detail, leak.score)
+            format!("code from {} ({} fragments{gz})", leak.detail, leak.score)
         };
         // With an inline prompter (--ask), let the user decide per leak;
         // otherwise fail safe and block. Default (timeout/no answer) is block.

@@ -13,10 +13,13 @@
 // local code is a real exfiltration signal.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 
 /// k-gram length (over whitespace-stripped bytes).
 const K: usize = 32;
+/// Cap on decompressed output, to defuse a decompression bomb.
+const DECOMP_CAP: u64 = 64 * 1024 * 1024;
 /// Keep ~1 in 8 k-grams (deterministic content sampling): a shared substring
 /// long enough will share sampled fingerprints on both sides.
 const SAMPLE_MASK: u64 = 0x7;
@@ -52,6 +55,25 @@ pub struct Leak {
     pub kind: &'static str, // "honeytoken" | "code"
     pub detail: String,     // the token, or the matched file
     pub score: usize,       // matched fingerprints (0 for honeytoken)
+    pub compressed: bool,   // the body was gzip/zlib compressed
+}
+
+/// Decompresses a gzip or zlib body (recognized by its magic bytes), capped to
+/// defuse a decompression bomb. Returns None if it is not compressed or the
+/// stream is corrupt. This lets scanning see through compressed exfiltration.
+fn maybe_decompress(body: &[u8]) -> Option<Vec<u8>> {
+    let reader: Box<dyn Read> = if body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b {
+        Box::new(flate2::read::GzDecoder::new(body))
+    } else if body.len() >= 2 && body[0] == 0x78 && matches!(body[1], 0x01 | 0x9c | 0xda) {
+        Box::new(flate2::read::ZlibDecoder::new(body))
+    } else {
+        return None;
+    };
+    let mut out = Vec::new();
+    // A short read (corrupt tail) still yields the bytes decoded so far, which
+    // is enough to scan; only a hard error with nothing decoded gives up.
+    reader.take(DECOMP_CAP).read_to_end(&mut out).ok();
+    (!out.is_empty()).then_some(out)
 }
 
 fn hash64(bytes: &[u8]) -> u64 {
@@ -105,23 +127,30 @@ impl Detector {
     }
 
     /// Scans an outbound body. Returns the strongest leak signal, if any.
+    /// A gzip/zlib body is transparently decompressed first, so compressed
+    /// exfiltration is caught too.
     pub fn scan(&self, body: &[u8]) -> Option<Leak> {
+        let decompressed = maybe_decompress(body);
+        let compressed = decompressed.is_some();
+        let data = decompressed.as_deref().unwrap_or(body);
+
         // Honeytokens first (exact, high confidence).
         if !self.honeytokens.is_empty() {
-            let text = String::from_utf8_lossy(body);
+            let text = String::from_utf8_lossy(data);
             for t in &self.honeytokens {
                 if !t.is_empty() && text.contains(t.as_str()) {
                     return Some(Leak {
                         kind: "honeytoken",
                         detail: t.clone(),
                         score: 0,
+                        compressed,
                     });
                 }
             }
         }
         // Fingerprint overlap, tallied per source file.
         let mut per_file: HashMap<&str, usize> = HashMap::new();
-        for h in fingerprints(body) {
+        for h in fingerprints(data) {
             if let Some(file) = self.fps.get(&h) {
                 *per_file.entry(file.as_str()).or_insert(0) += 1;
             }
@@ -134,6 +163,7 @@ impl Detector {
                 kind: "code",
                 detail: file.to_string(),
                 score: n,
+                compressed,
             })
     }
 }

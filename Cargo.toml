@@ -16,6 +16,9 @@ rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
+# Leak detection (--detect): decompress gzip/zlib bodies before scanning.
+# Pure-Rust backend (miniz_oxide), no C dependency.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
 strip = true
