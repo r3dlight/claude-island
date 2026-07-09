@@ -10,6 +10,12 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 libc = "0.2"
+# Credential broker (--broker): TLS-terminating proxy that injects auth
+# outside the sandbox, so the token never enters it.
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 
 [profile.release]
 strip = true

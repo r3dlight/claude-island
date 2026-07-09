@@ -57,7 +57,7 @@ pub fn prune_stale(home: &Path) {
         };
         if let Some(project) = profile_project(&content) {
             if !Path::new(&project).exists() {
-                let _ = fs::remove_dir_all(entry.path());
+                fs::remove_dir_all(entry.path()).ok();
             }
         }
     }
@@ -172,6 +172,7 @@ pub fn generate(
     serve_ports: &[u16],
     connect_ports: &[u16],
     extra_env: &[(String, String)],
+    extra_reads: &[String],
 ) -> io::Result<Profile> {
     // rw targets of the claude profile: created upfront.
     for d in [".claude", ".cache/claude", ".cache/claude-cli-nodejs"] {
@@ -184,7 +185,7 @@ pub fn generate(
 
     let name = name_for(project, envs, ro, noexec, !deny.is_empty());
     let dir = home.join(".config/island/profiles").join(&name);
-    let _ = fs::remove_dir_all(&dir);
+    fs::remove_dir_all(&dir).ok();
     let landlock = dir.join("landlock");
     fs::create_dir_all(&landlock)?;
 
@@ -225,6 +226,21 @@ pub fn generate(
             ports_toml(connect_ports)
         ),
     )?;
+
+    // Extra read-only grants (e.g. the credential broker's CA bundle).
+    if !extra_reads.is_empty() {
+        let arr = extra_reads
+            .iter()
+            .map(|p| format!("\"{}\"", toml_str(p)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            landlock.join("40-reads.toml"),
+            format!(
+                "{HEADER}\n[[path_beneath]]\nallowed_access = [\"read_file\"]\nparent = [{arr}]\n"
+            ),
+        )?;
+    }
     if !serve_ports.is_empty() {
         fs::write(
             landlock.join("20-serve.toml"),

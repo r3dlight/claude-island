@@ -290,6 +290,35 @@ silently denying it. It adapts to the environment:
   `watch` runs in any second terminal, needs no notifier and no tmux, and is
   the universal path.
 
+## Credential broker: `--broker`
+
+By default the `gh` CLI does not work inside the sandbox (its token is
+scrubbed and protected). `--broker` makes `gh`, `git` and `curl` work
+against GitHub **without the token ever entering the sandbox**:
+
+```sh
+GITHUB_TOKEN=ghp_...   # in your shell, outside the sandbox
+claude-island --broker
+```
+
+`--broker` implies `--proxy` and starts a TLS-terminating proxy outside the
+sandbox. For GitHub hosts it presents a leaf certificate signed by an
+ephemeral session CA that the sandbox is told to trust (via `SSL_CERT_FILE`
+and friends, pointing at a bundle of the system roots plus our CA). It reads
+the plaintext request, replaces any `Authorization` with the real credential
+(`GITHUB_TOKEN`/`GH_TOKEN` from your environment), and forwards it over a
+fresh, fully verified TLS connection to the real host. So:
+
+* the real token lives only in the wrapper, never in the sandbox (not in
+  files, not in the environment, not in any tool's memory);
+* `gh` gets a placeholder `GH_TOKEN` so it believes it is logged in; the
+  broker swaps in the real token upstream;
+* non-GitHub hosts are tunnelled untouched (normal `--proxy` behaviour);
+* the session CA is generated fresh each run and trusted nowhere else.
+
+Verify with `~/.cache/claude-island/proxy.log` (`brokered: ...` lines). Only
+GitHub is brokered for now.
+
 ## Code review mode: `--ro` and `--noexec`
 
 For unknown repositories (unaudited code, possible prompt injection in the
@@ -385,8 +414,9 @@ root or auditd to read, whereas strace traces our own process tree. Requires
 * git works over HTTPS inside the sandbox; SSH push happens outside
   (`nosandbox git push` with the zsh hook). Neither keys nor agent are ever
   exposed.
-* The `gh` CLI does not work inside (its token stays protected): use it
-  outside.
+* The `gh` CLI does not work inside by default (its token stays protected):
+  use it outside, or run with `--broker` to make it (and `git`/`curl` against
+  GitHub) work without the token entering the sandbox (see above).
 * Tools that hardcode `/tmp` fail: `TMPDIR` points to an isolated,
   per-profile workspace.
 * `claude-island explain [flags]` prints a readable summary of what the

@@ -354,6 +354,6 @@ pub fn verify(e: &EnvSpec, home: &Path) -> Result<(), String> {
 
 pub fn prepare(e: &EnvSpec, home: &Path) {
     for d in e.create {
-        let _ = fs::create_dir_all(home.join(d));
+        fs::create_dir_all(home.join(d)).ok();
     }
 }

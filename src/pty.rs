@@ -245,8 +245,8 @@ pub fn run(
                      \x1b[1;97m{}\x1b[0m ?  \x1b[1;94m[y/N]\x1b[0m ",
                     req.domain
                 );
-                let _ = stdout.write_all(prompt.as_bytes());
-                let _ = stdout.flush();
+                stdout.write_all(prompt.as_bytes()).ok();
+                stdout.flush().ok();
                 asking = Some(req);
             }
         }
@@ -298,8 +298,8 @@ pub fn run(
                     if asking.is_some() {
                         buffered.extend_from_slice(&buf[..k]);
                     } else {
-                        let _ = stdout.write_all(&buf[..k]);
-                        let _ = stdout.flush();
+                        stdout.write_all(&buf[..k]).ok();
+                        stdout.flush().ok();
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -330,16 +330,16 @@ pub fn run(
                                 req.domain
                             )
                         };
-                        let _ = stdout.write_all(echo.as_bytes());
-                        let _ = req.reply.send(answer);
+                        stdout.write_all(echo.as_bytes()).ok();
+                        req.reply.send(answer).ok();
                         // Flush any output that arrived during the prompt.
                         if !buffered.is_empty() {
-                            let _ = stdout.write_all(&buffered);
+                            stdout.write_all(&buffered).ok();
                             buffered.clear();
                         }
-                        let _ = stdout.flush();
+                        stdout.flush().ok();
                     } else {
-                        let _ = master_file.write_all(&buf[..k]);
+                        master_file.write_all(&buf[..k]).ok();
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -359,10 +359,10 @@ pub fn run(
 
     // Answer any outstanding prompts with deny so proxy threads unblock.
     if let Some(req) = asking.take() {
-        let _ = req.reply.send(false);
+        req.reply.send(false).ok();
     }
     for req in queue.drain(..) {
-        let _ = req.reply.send(false);
+        req.reply.send(false).ok();
     }
 
     let status = match reaped {

@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::broker::Broker;
 use crate::pty::Prompter;
 
 pub struct Proxy {
@@ -53,6 +54,8 @@ struct State {
     notified: Mutex<HashSet<String>>,
     /// Cached inline decisions this session, to avoid re-prompting a host.
     decisions: Mutex<HashMap<String, bool>>,
+    /// Credential broker: TLS-terminate and inject auth for certain hosts.
+    broker: Option<Arc<Broker>>,
     log: Log,
 }
 
@@ -62,8 +65,8 @@ fn log_line(log: &Log, msg: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if let Ok(mut w) = log.lock() {
-        let _ = writeln!(w, "[{ts}] {msg}");
-        let _ = w.flush();
+        writeln!(w, "[{ts}] {msg}").ok();
+        w.flush().ok();
     }
 }
 
@@ -126,10 +129,12 @@ impl State {
         domains.sort();
         domains.dedup();
         if let Some(parent) = self.allow_file.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent).ok();
         }
         let body: String = domains.iter().map(|d| format!("{d}\n")).collect();
-        let _ = fs::write(&self.allow_file, body);
+        if let Err(e) = fs::write(&self.allow_file, body) {
+            log_line(&self.log, &format!("failed to persist allowlist: {e}"));
+        }
     }
 
     /// On an interactive denial: record the host once, then notify.
@@ -148,10 +153,12 @@ impl State {
         if !pending.iter().any(|d| d == &host) {
             pending.push(host.clone());
             if let Some(parent) = self.pending_file.parent() {
-                let _ = fs::create_dir_all(parent);
+                fs::create_dir_all(parent).ok();
             }
             let body: String = pending.iter().map(|d| format!("{d}\n")).collect();
-            let _ = fs::write(&self.pending_file, body);
+            if let Err(e) = fs::write(&self.pending_file, body) {
+                log_line(&self.log, &format!("failed to record pending domain: {e}"));
+            }
         }
         notify(&host);
     }
@@ -168,12 +175,13 @@ fn notify(host: &str) {
     let msg = format!("claude-island: blocked {host} (approve: claude-island approve {host})");
     if let Ok(hook) = std::env::var("CLAUDE_ISLAND_NOTIFY") {
         if !hook.trim().is_empty() {
-            let _ = Command::new("sh")
+            Command::new("sh")
                 .arg("-c")
                 .arg(&hook)
                 .arg("--")
                 .arg(&msg)
-                .spawn();
+                .spawn()
+                .ok();
             return;
         }
     }
@@ -186,10 +194,11 @@ fn notify(host: &str) {
         return;
     }
     if std::env::var("TMUX").is_ok() {
-        let _ = Command::new("tmux")
+        Command::new("tmux")
             .arg("display-message")
             .arg(&msg)
-            .status();
+            .status()
+            .ok();
     }
 }
 
@@ -201,6 +210,7 @@ pub fn start(
     pending_file: PathBuf,
     interactive: bool,
     prompter: Option<Prompter>,
+    broker: Option<Arc<Broker>>,
     log_path: &Path,
 ) -> io::Result<Proxy> {
     if let Some(parent) = log_path.parent() {
@@ -235,6 +245,7 @@ pub fn start(
         prompter,
         notified: Mutex::new(HashSet::new()),
         decisions: Mutex::new(HashMap::new()),
+        broker,
         log,
     });
     spawn_accept_loop(listener, state);
@@ -251,13 +262,16 @@ fn spawn_accept_loop(listener: TcpListener, state: Arc<State>) {
 }
 
 fn respond(client: &mut TcpStream, status: &str) {
-    let _ = client.write_all(
-        format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").as_bytes(),
-    );
+    client
+        .write_all(
+            format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok();
 }
 
 fn handle(mut client: TcpStream, state: &State) {
-    let _ = client.set_read_timeout(Some(Duration::from_secs(15)));
+    client.set_read_timeout(Some(Duration::from_secs(15))).ok();
 
     // Read the request header (capped at 8 KiB).
     let mut buf = [0u8; 8192];
@@ -316,10 +330,33 @@ fn handle(mut client: TcpStream, state: &State) {
         return;
     }
 
+    // Credential broker: for configured hosts, terminate TLS here and inject
+    // the real credential (which never enters the sandbox) instead of a plain
+    // tunnel. Only over 443.
+    if port == 443 {
+        if let Some(broker) = &state.broker {
+            if broker.brokers(host) {
+                let host = host.to_string();
+                client.set_read_timeout(None).ok();
+                if client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .is_err()
+                {
+                    return;
+                }
+                match broker.mitm(client, &host, port) {
+                    Ok(()) => log_line(&state.log, &format!("brokered: {host}:{port}")),
+                    Err(e) => log_line(&state.log, &format!("broker error {host}: {e}")),
+                }
+                return;
+            }
+        }
+    }
+
     match TcpStream::connect((host, port)) {
         Ok(server) => {
             log_line(&state.log, &format!("allowed: {host}:{port}"));
-            let _ = client.set_read_timeout(None);
+            client.set_read_timeout(None).ok();
             if client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .is_err()
@@ -344,14 +381,14 @@ fn tunnel(client: TcpStream, server: TcpStream) {
     };
     let up = thread::spawn(move || {
         let mut c = c_read;
-        let _ = io::copy(&mut c, &mut s_write);
-        let _ = s_write.shutdown(Shutdown::Write);
+        io::copy(&mut c, &mut s_write).ok();
+        s_write.shutdown(Shutdown::Write).ok();
     });
     let mut s_read = server;
     let mut c_write = client;
-    let _ = io::copy(&mut s_read, &mut c_write);
-    let _ = c_write.shutdown(Shutdown::Write);
-    let _ = up.join();
+    io::copy(&mut s_read, &mut c_write).ok();
+    c_write.shutdown(Shutdown::Write).ok();
+    up.join().ok();
 }
 
 /// Internal test mode: `claude-island __proxy dom1 dom2...` prints the
@@ -364,7 +401,7 @@ pub fn standalone(domains: &[String]) -> Result<std::process::ExitCode, String> 
         .map_err(|e| format!("proxy local address: {e}"))?
         .port();
     println!("{port}");
-    let _ = io::stdout().flush();
+    io::stdout().flush().ok();
     let state = Arc::new(State {
         fixed: domains.to_vec(),
         allow_file: PathBuf::from("/nonexistent"),
@@ -373,6 +410,7 @@ pub fn standalone(domains: &[String]) -> Result<std::process::ExitCode, String> 
         prompter: None,
         notified: Mutex::new(HashSet::new()),
         decisions: Mutex::new(HashMap::new()),
+        broker: None,
         log,
     });
     spawn_accept_loop(listener, state);

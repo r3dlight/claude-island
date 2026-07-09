@@ -160,7 +160,7 @@ pub fn run_all(m: Modes) -> ExitCode {
             let p = home.join(dir).join("claude-island-canary-forbidden");
             match File::create(&p) {
                 Ok(_) => {
-                    let _ = fs::remove_file(&p);
+                    fs::remove_file(&p).ok();
                     Fail(format!("creation GRANTED in ~/{dir}"))
                 }
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
@@ -173,7 +173,7 @@ pub fn run_all(m: Modes) -> ExitCode {
         let p = home.join(".claude-island-canary-forbidden");
         match File::create(&p) {
             Ok(_) => {
-                let _ = fs::remove_file(&p);
+                fs::remove_file(&p).ok();
                 Fail("creation GRANTED in $HOME".into())
             }
             Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
@@ -230,7 +230,7 @@ pub fn run_all(m: Modes) -> ExitCode {
             let p = cdir.join("w");
             match File::create(&p) {
                 Ok(_) => {
-                    let _ = fs::remove_file(&p);
+                    fs::remove_file(&p).ok();
                     Fail("write GRANTED in a read-only project".into())
                 }
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
@@ -245,7 +245,7 @@ pub fn run_all(m: Modes) -> ExitCode {
         record("allow: write inside the project", {
             let p = cdir.join("w");
             let r = File::create(&p).map(|_| ());
-            let _ = fs::remove_file(&p);
+            fs::remove_file(&p).ok();
             expect_allowed(r)
         });
     }
@@ -297,7 +297,7 @@ pub fn run_all(m: Modes) -> ExitCode {
             "deny (--deny): create a new file at the project root",
             match File::create(project.join(".claude-island-canary-rootnew")) {
                 Ok(_) => {
-                    let _ = fs::remove_file(project.join(".claude-island-canary-rootnew"));
+                    fs::remove_file(project.join(".claude-island-canary-rootnew")).ok();
                     Fail("root file creation GRANTED under --deny".into())
                 }
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => Pass,
@@ -328,7 +328,7 @@ pub fn run_all(m: Modes) -> ExitCode {
             Ok(t) => {
                 let p = PathBuf::from(t).join("claude-island-canary");
                 let r = File::create(&p).map(|_| ());
-                let _ = fs::remove_file(&p);
+                fs::remove_file(&p).ok();
                 expect_allowed(r)
             }
             Err(_) => Skip("TMPDIR not set".into()),

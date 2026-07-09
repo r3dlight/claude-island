@@ -8,6 +8,7 @@
 // Error handling: no panicking calls (unwrap/expect); everything bubbles up
 // as Result<_, String> to main, which prints one clean message and exits 2.
 
+mod broker;
 mod canary;
 mod denials;
 mod envs;
@@ -114,6 +115,9 @@ Options:
   --ask            implies --proxy; a blocked domain is recorded as pending
                    (approve later with `claude-island watch`/`approve`),
                    asynchronously, without touching the agent's terminal
+  --broker         implies --proxy; make gh/git work against GitHub without
+                   the token entering the sandbox (TLS-terminating broker
+                   using GITHUB_TOKEN/GH_TOKEN from your environment)
   --allow DOMAIN   add a domain to the proxy allowlist (repeatable)
   --serve          allow TCP bind on 3000, 4321, 5173, 8000, 8080
   --ports P1,P2    additional bind ports
@@ -140,6 +144,7 @@ struct Opts {
     deny: Vec<String>,
     proxy: bool,
     ask: bool,
+    broker: bool,
     serve: bool,
     ports: Vec<u16>,
     allow: Vec<String>,
@@ -181,6 +186,10 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
             "--ask" => {
                 o.proxy = true;
                 o.ask = true;
+            }
+            "--broker" => {
+                o.proxy = true;
+                o.broker = true;
             }
             "--serve" => o.serve = true,
             "--dry-run" => o.dry_run = true,
@@ -447,6 +456,7 @@ fn scrub_env(cmd: &mut Command) {
 struct NetSetup {
     connect_ports: Vec<u16>,
     extra_env: Vec<(String, String)>,
+    extra_reads: Vec<String>,
     _proxy: Option<proxy::Proxy>,
 }
 
@@ -461,18 +471,21 @@ fn setup_network(
         return Ok(NetSetup {
             connect_ports: vec![443, 80, 53],
             extra_env: vec![],
+            extra_reads: vec![],
             _proxy: None,
         });
     }
     let fixed = fixed_domains(sel, &o.allow);
     let log = home.join(".cache/claude-island/proxy.log");
     let inline = prompter.is_some();
+    let bs = build_broker(o, home)?;
     let p = proxy::start(
         fixed,
         allow_file(home),
         pending_file(home),
         interactive,
         prompter,
+        bs.broker,
         &log,
     )
     .map_err(|e| format!("cannot start the proxy: {e}"))?;
@@ -502,10 +515,106 @@ fn setup_network(
     for k in ["NO_PROXY", "no_proxy"] {
         extra_env.push((k.to_string(), "localhost,127.0.0.1".to_string()));
     }
+    extra_env.extend(bs.env);
     Ok(NetSetup {
         connect_ports: vec![p.port, 53],
         extra_env,
+        extra_reads: bs.reads,
         _proxy: Some(p),
+    })
+}
+
+/// Result of setting up the credential broker.
+#[derive(Default)]
+struct BrokerSetup {
+    broker: Option<std::sync::Arc<broker::Broker>>,
+    /// env vars to inject into the sandbox (CA trust + placeholder GH_TOKEN)
+    env: Vec<(String, String)>,
+    /// paths to grant read access to (the CA bundle)
+    reads: Vec<String>,
+}
+
+/// Builds the GitHub credential broker when `--broker` is set and a token is
+/// available in the wrapper environment.
+fn build_broker(o: &Opts, home: &std::path::Path) -> Result<BrokerSetup> {
+    if !o.broker {
+        return Ok(BrokerSetup::default());
+    }
+    let token = env::var("GITHUB_TOKEN")
+        .ok()
+        .or_else(|| env::var("GH_TOKEN").ok());
+    let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
+        eprintln!("claude-island: --broker: no GITHUB_TOKEN/GH_TOKEN in the environment, skipping");
+        return Ok(BrokerSetup::default());
+    };
+    let cred = broker::Credential {
+        hosts: [
+            "github.com",
+            "api.github.com",
+            "codeload.github.com",
+            "uploads.github.com",
+            "raw.githubusercontent.com",
+            "objects.githubusercontent.com",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        bearer_hosts: ["api.github.com", "uploads.github.com"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        token,
+    };
+    let Some(b) = broker::Broker::new(vec![cred])? else {
+        return Ok(BrokerSetup::default());
+    };
+
+    // Combined CA bundle = system roots + our session CA, so the sandbox
+    // trusts both brokered (our CA) and tunnelled (real CA) hosts.
+    let system = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok())
+    .unwrap_or_default();
+    let bundle_path = home.join(".cache/claude-island/session-ca.pem");
+    if let Some(parent) = bundle_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("ca dir: {e}"))?;
+    }
+    std::fs::write(
+        &bundle_path,
+        format!(
+            "{system}
+{}",
+            b.ca_pem()
+        ),
+    )
+    .map_err(|e| format!("writing CA bundle: {e}"))?;
+    let bundle = bundle_path.to_string_lossy().to_string();
+
+    let mut envs = vec![];
+    for k in [
+        "SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+        "GIT_SSL_CAINFO",
+        "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    ] {
+        envs.push((k.to_string(), bundle.clone()));
+    }
+    // gh only sends a request if it believes it is authenticated; give it a
+    // placeholder token that the broker replaces with the real one.
+    envs.push((
+        "GH_TOKEN".to_string(),
+        "brokered_by_claude_island".to_string(),
+    ));
+
+    eprintln!("claude-island: --broker: GitHub credential broker active (token stays outside the sandbox)");
+    Ok(BrokerSetup {
+        broker: Some(b),
+        env: envs,
+        reads: vec![bundle],
     })
 }
 
@@ -755,6 +864,7 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         &serve_ports,
         &net.connect_ports,
         &net.extra_env,
+        &net.extra_reads,
     )
     .map_err(|e| format!("profile generation: {e}"))?;
 
@@ -885,6 +995,7 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         &[],
         &net.connect_ports,
         &net.extra_env,
+        &net.extra_reads,
     )
     .map_err(|e| format!("profile generation: {e}"))?;
 
@@ -916,9 +1027,9 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         cmd.arg("--deny").arg(d);
     }
     let status = cmd.status();
-    let _ = std::fs::remove_file(&target);
-    let _ = std::fs::remove_dir_all(&canary_dir);
-    let _ = std::fs::remove_dir_all(&denied_dir);
+    std::fs::remove_file(&target).ok();
+    std::fs::remove_dir_all(&canary_dir).ok();
+    std::fs::remove_dir_all(&denied_dir).ok();
     let status = status.map_err(|e| format!("failed to run island: {e}"))?;
     Ok(exit_code(status))
 }
@@ -1150,6 +1261,7 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         &serve_ports,
         &net.connect_ports,
         &net.extra_env,
+        &net.extra_reads,
     )
     .map_err(|e| format!("profile generation: {e}"))?;
 
@@ -1171,12 +1283,11 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         .args(["island", "run", "-p", &prof.name, "--"])
         .args(&o.rest);
     scrub_env(&mut cmd);
-    let _ = cmd
-        .status()
+    cmd.status()
         .map_err(|e| format!("failed to run strace: {e}"))?;
 
     let output = std::fs::read_to_string(&log).map_err(|e| format!("reading strace log: {e}"))?;
-    let _ = std::fs::remove_file(&log);
+    std::fs::remove_file(&log).ok();
     let found = denials::parse(&output);
 
     if o.json {
@@ -1250,7 +1361,7 @@ fn approve_domains(home: &std::path::Path, domains: &[String]) -> Result<Vec<Str
         .filter(|p| !domains.iter().any(|d| d.trim().eq_ignore_ascii_case(p)))
         .collect();
     let body: String = remaining.iter().map(|d| format!("{d}\n")).collect();
-    let _ = std::fs::write(&pf, body);
+    std::fs::write(&pf, body).ok();
     Ok(added)
 }
 
@@ -1309,7 +1420,7 @@ fn cmd_watch() -> Result<ExitCode> {
                 continue;
             }
             print!("blocked: {d}  — approve? [y]es / [n]o / [q]uit: ");
-            let _ = std::io::stdout().flush();
+            std::io::stdout().flush().ok();
             let mut line = String::new();
             if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
                 return Ok(ExitCode::SUCCESS); // EOF
