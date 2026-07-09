@@ -103,6 +103,7 @@ claude-island --ro                  project in READ-ONLY mode (code review)
 claude-island --noexec              deny running project files (combines with --ro)
 claude-island --deny .git --deny .env  protect top-level entries from the agent
 claude-island --proxy               network filtered by domain allowlist
+claude-island --ask                 prompt to approve each new domain (inline)
 claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
 claude-island denials -- cargo build  run a command, report every access it was denied
 claude-island check                 canary suite: verify the sandbox holds
@@ -209,7 +210,49 @@ gitlab.example.com          # a domain also covers its subdomains
 * one-off additions: `--allow <domain>`.
 
 Denials and grants are logged to `~/.cache/claude-island/proxy.log`: check
-it to see what Claude actually tried to reach, and refine the list.
+it to see what Claude actually tried to reach, and refine the list. That log
+is also the session trace of which domains were contacted and which were
+approved (`APPROVED (inline)` / `DENIED (inline)` lines). Because the proxy
+is a CONNECT tunnel, it sees hosts, ports and timing, not the encrypted
+payload (content inspection would need TLS termination, which we do not do).
+
+### Interactive approval: `--ask`
+
+`--ask` (implies `--proxy`) asks you to approve each new domain instead of
+silently denying it. It adapts to the environment:
+
+* **With a real terminal**, claude-island wraps Claude Code in a PTY and
+  prompts inline, exactly like Claude Code's own permission prompts:
+
+  ```
+  [claude-island] allow network to api.example.dev ? [y/N]
+  ```
+
+  The connection pauses until you answer; `y` (a single keystroke) approves
+  it, persists the domain to `domains.allow` (so it is remembered), and lets
+  it through. A domain is asked once per session. Answer promptly: the
+  underlying tool (curl, git, ...) keeps its own timeout, so a slow answer
+  may make that first attempt give up. The approval is saved either way, so
+  a retry succeeds immediately.
+
+  Testing the overlay without a full Claude session: `CLAUDE_ISLAND_EXEC`
+  overrides the wrapped program, e.g. `CLAUDE_ISLAND_EXEC=bash
+  claude-island --ask` gives a sandboxed shell where you can trigger
+  connections by hand.
+
+* **Without a TTY** (piped, headless, cron), it falls back to the
+  asynchronous flow: the blocked domain is appended to a pending list and a
+  best-effort notification fires (a `CLAUDE_ISLAND_NOTIFY` hook, else
+  `notify-send`, else a tmux status message). You approve out of band:
+
+  ```sh
+  claude-island watch                 # live: prompts for each blocked domain
+  claude-island approve api.example.dev   # or approve specific domains
+  claude-island approve --all
+  ```
+
+  `watch` runs in any second terminal, needs no notifier and no tmux, and is
+  the universal path.
 
 ## Code review mode: `--ro` and `--noexec`
 

@@ -120,6 +120,7 @@ fn project_rules(project: &Path, access: &str, deny: &[String]) -> String {
     body
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate(
     home: &Path,
     project: &Path,

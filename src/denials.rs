@@ -89,18 +89,16 @@ fn classify_fs(syscall: &str, line: &str) -> Option<(String, String)> {
         "unlink" | "unlinkat" | "rename" | "renameat" | "renameat2" | "mkdir" | "mkdirat"
         | "rmdir" | "chmod" | "fchmodat" | "chown" | "fchownat" | "truncate" | "link"
         | "linkat" | "symlink" | "symlinkat" | "mknod" | "mknodat" | "utimensat" => "write",
-        "openat" | "open" => {
-            // Write if any write-ish flag is present, else read.
+        // Write if any write-ish flag is present, else read.
+        "openat" | "open"
             if line.contains("O_WRONLY")
                 || line.contains("O_RDWR")
                 || line.contains("O_CREAT")
-                || line.contains("O_TRUNC")
-            {
-                "write"
-            } else {
-                "read"
-            }
+                || line.contains("O_TRUNC") =>
+        {
+            "write"
         }
+        "openat" | "open" => "read",
         _ => "read", // stat, access, readlink, getdents, statx, ...
     };
     Some((kind.to_string(), path))

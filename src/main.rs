@@ -15,10 +15,13 @@ mod explain;
 mod profile;
 mod project_config;
 mod proxy;
+mod pty;
 
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+use std::thread;
+use std::time::Duration;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -82,6 +85,9 @@ Usage:
                                        access it denied (add --json for JSONL)
   claude-island allow                  approve the project's .claude-island.toml
                                        (required again after any change)
+  claude-island watch                  live-approve domains blocked by --ask
+  claude-island approve [DOMAIN...]    approve blocked domains (--all for every
+                                       pending one); no args lists them
   claude-island --list                 list available environments
 
 Options:
@@ -102,6 +108,9 @@ Options:
   --proxy          network restricted to a domain-filtering proxy
                    (allowlist: base domains + environments + --allow +
                    ~/.config/claude-island/domains.allow)
+  --ask            implies --proxy; a blocked domain is recorded as pending
+                   (approve later with `claude-island watch`/`approve`),
+                   asynchronously, without touching the agent's terminal
   --allow DOMAIN   add a domain to the proxy allowlist (repeatable)
   --serve          allow TCP bind on 3000, 4321, 5173, 8000, 8080
   --ports P1,P2    additional bind ports
@@ -125,6 +134,7 @@ struct Opts {
     noexec: bool,
     deny: Vec<String>,
     proxy: bool,
+    ask: bool,
     serve: bool,
     ports: Vec<u16>,
     allow: Vec<String>,
@@ -161,6 +171,10 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
             "--ro" => o.ro = true,
             "--noexec" => o.noexec = true,
             "--proxy" => o.proxy = true,
+            "--ask" => {
+                o.proxy = true;
+                o.ask = true;
+            }
             "--serve" => o.serve = true,
             "--dry-run" => o.dry_run = true,
             "--json" => o.json = true,
@@ -353,22 +367,35 @@ fn resolve_envs<'a>(
     Ok(sel)
 }
 
-/// Proxy allowlist: base + environments + user file + --allow.
-fn proxy_domains(sel: &[&envs::EnvSpec], allow: &[String], home: &std::path::Path) -> Vec<String> {
+/// The persistent domain allowlist (approved once, applies to every session).
+fn allow_file(home: &std::path::Path) -> PathBuf {
+    home.join(".config/claude-island/domains.allow")
+}
+
+/// Denied domains awaiting `claude-island approve` / `watch`.
+fn pending_file(home: &std::path::Path) -> PathBuf {
+    home.join(".cache/claude-island/pending-domains.list")
+}
+
+/// The fixed proxy allowlist: base + active environments + --allow. The
+/// persistent domains.allow file is read live by the proxy (so approvals
+/// take effect without restart), not folded in here.
+fn fixed_domains(sel: &[&envs::EnvSpec], allow: &[String]) -> Vec<String> {
     let mut domains: Vec<String> = BASE_DOMAINS.iter().map(|s| s.to_string()).collect();
     for e in sel {
         domains.extend(e.domains.iter().map(|s| s.to_string()));
     }
-    let user_file = home.join(".config/claude-island/domains.allow");
-    if let Ok(content) = std::fs::read_to_string(&user_file) {
-        for line in content.lines() {
-            let d = line.split('#').next().unwrap_or("").trim();
-            if !d.is_empty() {
-                domains.push(d.to_string());
-            }
-        }
-    }
     domains.extend(allow.iter().cloned());
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
+/// The full static allowlist snapshot, for display only (explain): fixed
+/// plus the current contents of domains.allow.
+fn proxy_domains(sel: &[&envs::EnvSpec], allow: &[String], home: &std::path::Path) -> Vec<String> {
+    let mut domains = fixed_domains(sel, allow);
+    domains.extend(proxy::read_domains_file(&allow_file(home)));
     domains.sort();
     domains.dedup();
     domains
@@ -406,7 +433,13 @@ struct NetSetup {
     _proxy: Option<proxy::Proxy>,
 }
 
-fn setup_network(o: &Opts, sel: &[&envs::EnvSpec], home: &std::path::Path) -> Result<NetSetup> {
+fn setup_network(
+    o: &Opts,
+    sel: &[&envs::EnvSpec],
+    home: &std::path::Path,
+    interactive: bool,
+    prompter: Option<pty::Prompter>,
+) -> Result<NetSetup> {
     if !o.proxy {
         return Ok(NetSetup {
             connect_ports: vec![443, 80, 53],
@@ -414,14 +447,37 @@ fn setup_network(o: &Opts, sel: &[&envs::EnvSpec], home: &std::path::Path) -> Re
             _proxy: None,
         });
     }
-    let domains = proxy_domains(sel, &o.allow, home);
+    let fixed = fixed_domains(sel, &o.allow);
     let log = home.join(".cache/claude-island/proxy.log");
-    let p = proxy::start(domains, &log).map_err(|e| format!("cannot start the proxy: {e}"))?;
-    eprintln!(
-        "claude-island: filtering proxy on 127.0.0.1:{} (log: {})",
-        p.port,
-        log.display()
-    );
+    let inline = prompter.is_some();
+    let p = proxy::start(
+        fixed,
+        allow_file(home),
+        pending_file(home),
+        interactive,
+        prompter,
+        &log,
+    )
+    .map_err(|e| format!("cannot start the proxy: {e}"))?;
+    if inline {
+        eprintln!(
+            "claude-island: filtering proxy on 127.0.0.1:{} (inline: blocked domains prompt in \
+             the terminal)",
+            p.port
+        );
+    } else if interactive {
+        eprintln!(
+            "claude-island: filtering proxy on 127.0.0.1:{} (async: blocked domains go to \
+             `claude-island watch`)",
+            p.port
+        );
+    } else {
+        eprintln!(
+            "claude-island: filtering proxy on 127.0.0.1:{} (log: {})",
+            p.port,
+            log.display()
+        );
+    }
     let mut extra_env = vec![];
     for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         extra_env.push((k.to_string(), format!("http://127.0.0.1:{}", p.port)));
@@ -442,7 +498,16 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     validate_deny(&o.deny)?;
     let sel = resolve_envs(&o, registry, &project, &home, true)?;
 
-    let net = setup_network(&o, &sel, &home)?;
+    // Inline approval prompts (--ask) require a real terminal to wrap in a
+    // PTY; otherwise --ask falls back to the asynchronous pending-file flow.
+    let use_pty = o.ask && pty::have_tty();
+    let pump = if use_pty {
+        Some(pty::channel().map_err(|e| format!("cannot set up the PTY channel: {e}"))?)
+    } else {
+        None
+    };
+    let prompter = pump.as_ref().map(|(p, _, _)| p.clone());
+    let net = setup_network(&o, &sel, &home, o.ask, prompter)?;
 
     let mut serve_ports: Vec<u16> = vec![];
     if o.serve {
@@ -463,6 +528,49 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     )
     .map_err(|e| format!("profile generation: {e}"))?;
 
+    // The sandboxed program (CLAUDE_ISLAND_EXEC overrides "claude", handy for
+    // testing the overlay with e.g. bash). In the PTY path we must own the
+    // controlling terminal, so systemd-run (resource limits) is skipped there
+    // to keep the ctty setup deterministic; the normal path keeps it.
+    let program = env::var("CLAUDE_ISLAND_EXEC").unwrap_or_else(|_| "claude".into());
+    let island_argv: Vec<String> = ["island", "run", "-p", &prof.name, "--"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(program))
+        .chain(o.rest.iter().cloned())
+        .collect();
+
+    if o.dry_run {
+        println!("generated profile: {}", prof.dir.display());
+        println!("scrubbed variables: {}", SCRUB_ENV.join(", "));
+        println!(
+            "scrubbed patterns: *{} (kept: {})",
+            SCRUB_SUFFIXES.join(", *"),
+            KEEP_ENV.join(", ")
+        );
+        if use_pty {
+            println!("mode: inline PTY (no systemd-run resource limits)");
+        }
+        println!("command: {}", island_argv.join(" "));
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !envs::has_cmd("island") {
+        return Err("island not found in PATH: run ./install.sh first".into());
+    }
+
+    // Ctrl+C must reach the sandboxed claude, not kill the wrapper (which
+    // carries the proxy / PTY pump).
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
+
+    if let Some((_, rx, wake_r)) = pump {
+        // Inline PTY path: wrap the command and pump I/O + approval prompts.
+        return pty::run(&island_argv, scrub_env, rx, wake_r)
+            .map_err(|e| format!("pty overlay: {e}"));
+    }
+
+    // Normal path: optional systemd-run resource limits, then exec.
     let mut argv: Vec<String> = vec![];
     if envs::has_cmd("systemd-run") {
         argv.extend(
@@ -477,33 +585,8 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         argv.push("-p".into());
         argv.push(format!("TasksMax={tasks}"));
     }
-    argv.extend(
-        ["island", "run", "-p", &prof.name, "--", "claude"]
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    argv.extend(o.rest.iter().cloned());
+    argv.extend(island_argv);
 
-    if o.dry_run {
-        println!("generated profile: {}", prof.dir.display());
-        println!("scrubbed variables: {}", SCRUB_ENV.join(", "));
-        println!(
-            "scrubbed patterns: *{} (kept: {})",
-            SCRUB_SUFFIXES.join(", *"),
-            KEEP_ENV.join(", ")
-        );
-        println!("command: {}", argv.join(" "));
-        return Ok(ExitCode::SUCCESS);
-    }
-    if !envs::has_cmd("island") {
-        return Err("island not found in PATH: run ./install.sh first".into());
-    }
-
-    // Ctrl+C must reach the sandboxed claude (same process group), not kill
-    // the wrapper, which carries the proxy.
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-    }
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     scrub_env(&mut cmd);
@@ -521,7 +604,7 @@ fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     if !envs::has_cmd("island") {
         return Err("island not found in PATH: run ./install.sh first".into());
     }
-    let net = setup_network(&o, &sel, &home)?;
+    let net = setup_network(&o, &sel, &home, false, None)?;
 
     // Canary artifacts, created BEFORE profile generation so the carve logic
     // (deny mode) enumerates and grants them: a dedicated dir holding the
@@ -773,7 +856,7 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         return Err("island not found in PATH: run ./install.sh first".into());
     }
     let sel = resolve_envs(&o, registry, &project, &home, true)?;
-    let net = setup_network(&o, &sel, &home)?;
+    let net = setup_network(&o, &sel, &home, false, None)?;
     let mut serve_ports: Vec<u16> = vec![];
     if o.serve {
         serve_ports.extend_from_slice(DEV_SERVE_PORTS);
@@ -835,6 +918,118 @@ fn cmd_denials(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         println!("          -> {hint}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Appends domains to domains.allow (deduped) and removes them from the
+/// pending list. Returns the set actually added.
+fn approve_domains(home: &std::path::Path, domains: &[String]) -> Result<Vec<String>> {
+    let af = allow_file(home);
+    let mut current = proxy::read_domains_file(&af);
+    let mut added = vec![];
+    for d in domains {
+        let d = d.trim().to_ascii_lowercase();
+        if d.is_empty() {
+            continue;
+        }
+        if !current.iter().any(|c| c == &d) {
+            current.push(d.clone());
+            added.push(d);
+        }
+    }
+    if !added.is_empty() {
+        if let Some(parent) = af.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        current.sort();
+        current.dedup();
+        let body: String = current.iter().map(|d| format!("{d}\n")).collect();
+        std::fs::write(&af, body).map_err(|e| format!("writing {}: {e}", af.display()))?;
+    }
+    // Drop approved (and any explicitly named) domains from the pending list.
+    let pf = pending_file(home);
+    let remaining: Vec<String> = proxy::read_domains_file(&pf)
+        .into_iter()
+        .filter(|p| !domains.iter().any(|d| d.trim().eq_ignore_ascii_case(p)))
+        .collect();
+    let body: String = remaining.iter().map(|d| format!("{d}\n")).collect();
+    let _ = std::fs::write(&pf, body);
+    Ok(added)
+}
+
+/// `approve`: approve pending domains blocked by the interactive proxy.
+fn cmd_approve(args: &[String]) -> Result<ExitCode> {
+    let home = PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set")?);
+    let pending = proxy::read_domains_file(&pending_file(&home));
+
+    let all = args.iter().any(|a| a == "--all");
+    let named: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
+
+    if !all && named.is_empty() {
+        if pending.is_empty() {
+            println!("no pending domains");
+        } else {
+            println!("pending domains ({}):", pending.len());
+            for d in &pending {
+                println!("  {d}");
+            }
+            println!("approve with: claude-island approve <domain>...  (or --all)");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let targets = if all { pending.clone() } else { named };
+    if targets.is_empty() {
+        println!("nothing to approve");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let added = approve_domains(&home, &targets)?;
+    if added.is_empty() {
+        println!("already allowed: {}", targets.join(", "));
+    } else {
+        println!("approved (added to domains.allow): {}", added.join(", "));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `watch`: poll the pending file and interactively approve new domains.
+/// Universal: runs in its own terminal, needs no notifier and no tmux.
+fn cmd_watch() -> Result<ExitCode> {
+    use std::io::{BufRead, Write as _};
+    let home = PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set")?);
+    let pf = pending_file(&home);
+    println!("claude-island: watching for domains blocked by --ask (Ctrl-C to stop)");
+    let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Domains already pending at startup are shown first.
+    let stdin = std::io::stdin();
+    loop {
+        for d in proxy::read_domains_file(&pf) {
+            if handled.contains(&d) {
+                continue;
+            }
+            print!("blocked: {d}  — approve? [y]es / [n]o / [q]uit: ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+                return Ok(ExitCode::SUCCESS); // EOF
+            }
+            match line.trim() {
+                "y" | "Y" => {
+                    let added = approve_domains(&home, std::slice::from_ref(&d))?;
+                    println!(
+                        "  {} {d}",
+                        if added.is_empty() { "already allowed:" } else { "approved:" }
+                    );
+                    handled.insert(d);
+                }
+                "q" | "Q" => return Ok(ExitCode::SUCCESS),
+                _ => {
+                    println!("  skipped (still pending)");
+                    handled.insert(d);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(700));
+    }
 }
 
 /// Runs a command and turns a failure into an error message.
@@ -927,6 +1122,8 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         }
         Some("__proxy") => proxy::standalone(&args[1..]),
         Some("update") => cmd_update(),
+        Some("watch") => cmd_watch(),
+        Some("approve") => cmd_approve(&args[1..]),
         Some("denials") => {
             let registry = envs::registry();
             match parse(&args[1..], &registry)? {
