@@ -90,6 +90,30 @@ Requirements: Linux kernel 6.12+ (Landlock ABI 6), Rust 1.89+.
 The script also copies `~/.claude.json` into `~/.claude/` (the sandbox runs
 with `CLAUDE_CONFIG_DIR=~/.claude`); a login may be requested once.
 
+## Interactive setup
+
+Run `claude-island` with no arguments in a terminal and it asks the
+essentials, then launches with your choices:
+
+```
+$ claude-island
+detected environments: rust
+enable them? [Y/n]
+network:
+  [1] normal (outbound 443/80/53 to any host)
+  [2] filter and ask before each new domain (--ask)
+choice [1]: 2
+read-only project (code review)? [y/N]
+hide .git, .env from the agent (contents unreadable)? [y/N] y
+launching: claude-island --auto --ask --deny .git --deny .env
+proceed? [Y/n]
+```
+
+It auto-detects the project's environments and offers the common toggles
+(network filtering, read-only, hiding secrets found at the project root).
+Passing any flag skips it; so does a non-interactive context (piped, cron).
+Set `CLAUDE_ISLAND_NO_WIZARD=1` to always skip it.
+
 ## Everyday usage
 
 From a project directory under `$HOME`:

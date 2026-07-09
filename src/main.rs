@@ -74,6 +74,8 @@ const HELP: &str = "\
 claude-island: run Claude Code inside a Landlock sandbox via Island.
 
 Usage:
+  claude-island                        no args in a terminal: interactive setup
+                                       (set CLAUDE_ISLAND_NO_WIZARD=1 to skip)
   claude-island [OPTIONS] [-- CLAUDE_ARGS...]
   claude-island check [--<env>...] [--ro] [--proxy]
                                        verify the sandbox (canary suite)
@@ -490,6 +492,121 @@ fn setup_network(
         extra_env,
         _proxy: Some(p),
     })
+}
+
+/// Reads one trimmed line from stdin after printing a prompt.
+fn prompt_line(msg: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{msg}");
+    std::io::stdout().flush().ok();
+    let mut s = String::new();
+    if std::io::stdin().read_line(&mut s).map_err(|e| format!("read: {e}"))? == 0 {
+        return Err("aborted".into()); // EOF
+    }
+    Ok(s.trim().to_string())
+}
+
+/// Yes/no question with a default (accepts y/o for yes).
+fn ask_yesno(msg: &str, default_yes: bool) -> Result<bool> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let a = prompt_line(&format!("{msg} {suffix} "))?;
+    if a.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(a.chars().next(), Some('y' | 'Y' | 'o' | 'O')))
+}
+
+/// Interactive setup, run when `claude-island` is invoked with no arguments
+/// in a real terminal. Asks the essentials, then launches with the choices.
+fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
+    let (_home, project) = guards()?;
+    println!("claude-island: interactive setup (Enter accepts the default)\n");
+    let mut o = Opts::default();
+
+    // 1. Dev environments.
+    let detected = envs::auto_detect(&project, registry);
+    if !detected.is_empty() {
+        println!("detected environments: {}", detected.join(", "));
+        if ask_yesno("enable them?", true)? {
+            o.auto = true; // resolve_envs re-detects and skips missing toolchains
+        } else if ask_yesno("pick environments manually?", false)? {
+            let names = prompt_line("environments (space-separated, e.g. rust node): ")?;
+            for n in names.split_whitespace() {
+                match envs::resolve(registry, n) {
+                    Some(name) if !o.env_names.contains(&name) => o.env_names.push(name),
+                    Some(_) => {}
+                    None => eprintln!("  unknown environment: {n} (skipped)"),
+                }
+            }
+        }
+    } else {
+        let names = prompt_line("dev environments (space-separated, empty for none): ")?;
+        for n in names.split_whitespace() {
+            match envs::resolve(registry, n) {
+                Some(name) if !o.env_names.contains(&name) => o.env_names.push(name),
+                Some(_) => {}
+                None => eprintln!("  unknown environment: {n} (skipped)"),
+            }
+        }
+    }
+
+    // 2. Network.
+    println!("\nnetwork:");
+    println!("  [1] normal (outbound 443/80/53 to any host)");
+    println!("  [2] filter and ask before each new domain (--ask)");
+    let net = prompt_line("choice [1]: ")?;
+    if net == "2" {
+        o.ask = true;
+        o.proxy = true;
+    }
+
+    // 3. Read-only project (code review).
+    if ask_yesno("\nread-only project (code review)?", false)? {
+        o.ro = true;
+    }
+
+    // 4. Protect secrets present at the project root.
+    let candidates: Vec<String> = [".env", ".git", "secrets", ".aws", "credentials.json"]
+        .iter()
+        .filter(|f| project.join(f).exists())
+        .map(|s| s.to_string())
+        .collect();
+    if !candidates.is_empty()
+        && ask_yesno(
+            &format!("\nhide {} from the agent (contents unreadable)?", candidates.join(", ")),
+            false,
+        )?
+    {
+        o.deny = candidates;
+    }
+
+    // Summary and confirm.
+    let mut feats: Vec<String> = vec![];
+    if o.auto {
+        feats.push("--auto".into());
+    }
+    for e in &o.env_names {
+        feats.push(format!("--{e}"));
+    }
+    if o.ask {
+        feats.push("--ask".into());
+    }
+    if o.ro {
+        feats.push("--ro".into());
+    }
+    for d in &o.deny {
+        feats.push(format!("--deny {d}"));
+    }
+    println!(
+        "\nlaunching: claude-island {}",
+        if feats.is_empty() { "(base sandbox)".into() } else { feats.join(" ") }
+    );
+    if !ask_yesno("proceed?", true)? {
+        println!("cancelled");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!();
+    cmd_run(o, registry)
 }
 
 fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
@@ -1172,6 +1289,15 @@ fn dispatch(args: &[String]) -> Result<ExitCode> {
         }
         _ => {
             let registry = envs::registry();
+            // No arguments in a real terminal: run the interactive setup,
+            // unless disabled. Non-interactive (piped/cron) keeps the plain
+            // base-sandbox behavior.
+            if args.is_empty()
+                && pty::have_tty()
+                && env::var("CLAUDE_ISLAND_NO_WIZARD").is_err()
+            {
+                return cmd_wizard(&registry);
+            }
             match parse(args, &registry)? {
                 Parsed::Go(o) => cmd_run(o, &registry),
                 Parsed::Help => {
