@@ -145,6 +145,7 @@ claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
 claude-island --broker              gh/git/curl reach GitHub without the token entering the sandbox
 claude-island --inspect             log every outbound request (plaintext) for review
 claude-island --detect              block local code from leaving to non-Anthropic hosts
+claude-island --l7                  restrict terminated hosts to a method/path allowlist
 claude-island denials -- cargo build  run a command, report every access it was denied
 claude-island check                 canary suite: verify the sandbox holds
 claude-island check --ro            same, read-only variant
@@ -389,6 +390,28 @@ automatically and recorded as `!!! LEAK BLOCKED` in the audit log.
 Test it end to end with `scripts/test-detect.sh` (it exercises plain,
 gzipped, honeytoken and benign cases and checks each verdict), or ask Claude
 to `curl` a project file to an allowlisted test host and watch it get blocked.
+
+### Method/path allowlist: `--l7`
+
+The same TLS termination also enforces an application-layer allowlist. `--l7`
+reads `~/.config/claude-island/l7.rules` (one `host METHOD path-glob` per line,
+`#` comments) and, on any terminated host that appears in it, allows only
+matching requests and denies the rest with `403`. A host with no rule is
+untouched. `*` in the glob matches within a path segment, `**` across
+segments; `METHOD` may be `*`.
+
+```
+# ~/.config/claude-island/l7.rules
+api.github.com GET  /repos/**
+api.github.com GET  /user
+api.github.com POST /repos/*/*/issues
+```
+
+Combined with `--broker`, this restricts what the injected GitHub token can do
+(read issues, but not `DELETE /repos/...`), so a compromised agent cannot turn
+a read task into a destructive one. Denials are recorded as `!!! L7 DENIED` in
+the audit log. `--l7` composes with `--broker`/`--inspect`/`--detect`, or runs
+on its own (it terminates the listed hosts just to filter them).
 
 ## Code review mode: `--ro` and `--noexec`
 

@@ -127,6 +127,10 @@ Options:
                    honeytokens from ~/.config/claude-island/honeytokens) and
                    BLOCK any outbound request (to a non-Anthropic host) that
                    carries your local code, with an alert in the audit log
+  --l7             implies --proxy; enforce a method/path allowlist from
+                   ~/.config/claude-island/l7.rules (lines: `host METHOD glob`)
+                   on TLS-terminated hosts; a listed host is default-deny
+                   (e.g. let the GitHub token GET issues but not DELETE repos)
   --allow DOMAIN   add a domain to the proxy allowlist (repeatable)
   --serve          allow TCP bind on 3000, 4321, 5173, 8000, 8080
   --ports P1,P2    additional bind ports
@@ -156,6 +160,7 @@ struct Opts {
     broker: bool,
     inspect: bool,
     detect: bool,
+    l7: bool,
     serve: bool,
     ports: Vec<u16>,
     allow: Vec<String>,
@@ -210,6 +215,10 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
                 o.proxy = true;
                 o.inspect = true;
                 o.detect = true;
+            }
+            "--l7" => {
+                o.proxy = true;
+                o.l7 = true;
             }
             "--serve" => o.serve = true,
             "--dry-run" => o.dry_run = true,
@@ -564,8 +573,17 @@ fn build_broker(
     project: &std::path::Path,
     prompter: Option<pty::Prompter>,
 ) -> Result<BrokerSetup> {
-    if !o.broker && !o.inspect {
+    if !o.broker && !o.inspect && !o.l7 {
         return Ok(BrokerSetup::default());
+    }
+    // L7 method/path allowlist (--l7, or composed with broker/inspect).
+    let l7 = std::fs::read_to_string(home.join(".config/claude-island/l7.rules"))
+        .ok()
+        .and_then(|c| broker::L7Rules::parse(&c));
+    if o.l7 && l7.is_none() {
+        eprintln!(
+            "claude-island: --l7: no rules in ~/.config/claude-island/l7.rules, filtering inactive"
+        );
     }
     // Leak detector: index the project + load honeytokens (--detect).
     let detector = if o.detect {
@@ -624,16 +642,17 @@ fn build_broker(
     }
     // The audit log is APPENDED across sessions (a session marker delimits
     // them) so leak forensics keep their history instead of being wiped.
-    let audit = o
-        .inspect
-        .then(|| home.join(".cache/claude-island/outbound-audit.log"));
+    // Enabled by --inspect (full outbound trace) or --l7 (to log L7 denials).
+    let audit = (o.inspect || o.l7).then(|| home.join(".cache/claude-island/outbound-audit.log"));
     if let Some(a) = &audit {
         if let Some(parent) = a.parent() {
             std::fs::create_dir_all(parent).ok();
         }
     }
     let has_github = !creds.is_empty();
-    let Some(b) = broker::Broker::new(creds, o.inspect, audit.clone(), detector, prompter)? else {
+    let l7_active = l7.is_some();
+    let Some(b) = broker::Broker::new(creds, o.inspect, audit.clone(), detector, prompter, l7)?
+    else {
         return Ok(BrokerSetup::default());
     };
 
@@ -684,9 +703,12 @@ fn build_broker(
     if o.broker {
         eprintln!("claude-island: --broker: GitHub credential broker active (token stays outside the sandbox)");
     }
+    if l7_active {
+        eprintln!("claude-island: --l7: method/path allowlist active for governed hosts");
+    }
     if let Some(a) = &audit {
         eprintln!(
-            "claude-island: --inspect: auditing outbound requests to {}",
+            "claude-island: auditing outbound requests to {}",
             a.display()
         );
     }

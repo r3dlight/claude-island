@@ -34,6 +34,97 @@ const SCAN_CAP: usize = 8 * 1024 * 1024;
 /// Inspects an outbound body and returns whether to proceed (false = block).
 type Inspector<'a> = &'a dyn Fn(&[u8]) -> bool;
 
+/// Checks a request line (method, path) and returns whether it is allowed.
+type L7Check<'a> = &'a dyn Fn(&str, &str) -> bool;
+
+/// L7 method+path allowlist (like nono's endpoint_policy). A host that appears
+/// in any rule is "governed": only requests matching one of its rules pass,
+/// everything else to that host is denied. Hosts with no rule are untouched.
+/// This restricts what a request (and any injected credential) may do, e.g.
+/// let the GitHub token GET issues but not DELETE repos.
+pub struct L7Rules {
+    /// (host, method-or-`*`, path-glob), host lowercased.
+    rules: Vec<(String, String, String)>,
+}
+
+impl L7Rules {
+    /// Parses the rules file: `host METHOD path-glob` per line, `#` comments,
+    /// blank lines skipped. METHOD may be `*`. Returns None if no valid rule.
+    pub fn parse(text: &str) -> Option<L7Rules> {
+        let mut rules = vec![];
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            if let (Some(host), Some(method), Some(glob)) = (it.next(), it.next(), it.next()) {
+                rules.push((
+                    host.to_ascii_lowercase(),
+                    method.to_ascii_uppercase(),
+                    glob.to_string(),
+                ));
+            }
+        }
+        (!rules.is_empty()).then_some(L7Rules { rules })
+    }
+
+    fn governs(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.rules.iter().any(|(h, _, _)| *h == host)
+    }
+
+    /// Whether a request to `host` with `method`/`path` is allowed. A governed
+    /// host defaults to deny; an ungoverned host is always allowed.
+    fn allows(&self, host: &str, method: &str, path: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        let path = path.split('?').next().unwrap_or(path);
+        let mut governed = false;
+        for (h, m, glob) in &self.rules {
+            if *h != host {
+                continue;
+            }
+            governed = true;
+            if (m == "*" || m.eq_ignore_ascii_case(method))
+                && glob_match(glob.as_bytes(), path.as_bytes())
+            {
+                return true;
+            }
+        }
+        !governed
+    }
+}
+
+/// Glob match for URL paths: `*` matches any run of non-`/` characters, `**`
+/// matches any run including `/`. The whole path must match (anchored).
+fn glob_match(pat: &[u8], txt: &[u8]) -> bool {
+    if pat.is_empty() {
+        return txt.is_empty();
+    }
+    if pat[0] == b'*' {
+        if pat.get(1) == Some(&b'*') {
+            let rest = &pat[2..];
+            (0..=txt.len()).any(|i| glob_match(rest, &txt[i..]))
+        } else {
+            let rest = &pat[1..];
+            let mut i = 0;
+            loop {
+                if glob_match(rest, &txt[i..]) {
+                    return true;
+                }
+                if i >= txt.len() || txt[i] == b'/' {
+                    return false;
+                }
+                i += 1;
+            }
+        }
+    } else if !txt.is_empty() && pat[0] == txt[0] {
+        glob_match(&pat[1..], &txt[1..])
+    } else {
+        false
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -97,19 +188,23 @@ pub struct Broker {
     /// Inline prompter (--ask): ask the user before blocking a detected leak,
     /// instead of blocking outright.
     prompter: Option<Prompter>,
+    /// L7 method/path allowlist (--l7): governed hosts are default-deny.
+    l7: Option<L7Rules>,
 }
 
 impl Broker {
     /// Builds a broker with an ephemeral CA. Returns None if there is nothing
     /// to do (no credentials and no inspection).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         creds: Vec<Credential>,
         inspect: bool,
         audit_path: Option<PathBuf>,
         detector: Option<Arc<Detector>>,
         prompter: Option<Prompter>,
+        l7: Option<L7Rules>,
     ) -> Result<Option<Arc<Broker>>, String> {
-        if creds.is_empty() && !inspect {
+        if creds.is_empty() && !inspect && l7.is_none() {
             return Ok(None);
         }
         let audit = match audit_path {
@@ -166,6 +261,7 @@ impl Broker {
             audit,
             detector,
             prompter,
+            l7,
         })))
     }
 
@@ -174,10 +270,12 @@ impl Broker {
     }
 
     /// Should this host be TLS-terminated? True in inspection mode (every
-    /// host) or for a credential host.
+    /// host), for a credential host, or for an L7-governed host.
     pub fn should_terminate(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
-        self.inspect || self.creds.iter().any(|c| c.matches(&host))
+        self.inspect
+            || self.creds.iter().any(|c| c.matches(&host))
+            || self.l7.as_ref().is_some_and(|l| l.governs(&host))
     }
 
     fn credential_for(&self, host: &str) -> Option<&Credential> {
@@ -249,9 +347,29 @@ impl Broker {
         let closure = |body: &[u8]| self.check_leak(host, body);
         let inspector: Option<Inspector> = if scan { Some(&closure) } else { None };
 
-        let info = relay_http(&mut client, &mut upstream, header.as_deref(), inspector)?;
+        // L7 method/path allowlist: build a check for governed hosts.
+        let l7_closure = |method: &str, path: &str| self.check_l7(host, method, path);
+        let governed = self.l7.as_ref().is_some_and(|l| l.governs(host));
+        let l7: Option<L7Check> = if governed { Some(&l7_closure) } else { None };
+
+        let info = relay_http(&mut client, &mut upstream, header.as_deref(), inspector, l7)?;
         self.write_audit(host, &info);
         Ok(())
+    }
+
+    /// L7 verdict for one request line. Denials are logged to the audit.
+    fn check_l7(&self, host: &str, method: &str, path: &str) -> bool {
+        let Some(l7) = &self.l7 else { return true };
+        if l7.allows(host, method, path) {
+            return true;
+        }
+        if let Some(lock) = &self.audit {
+            if let Ok(mut f) = lock.lock() {
+                let ts = now_secs();
+                writeln!(f, "[{ts}] !!! L7 DENIED: {method} {path} -> {host}").ok();
+            }
+        }
+        false
     }
 
     /// Scans one outbound body for project content. Returns whether to proceed
@@ -347,6 +465,7 @@ fn relay_http<C: Read + Write, U: Read + Write>(
     upstream: &mut U,
     inject_header: Option<&str>,
     inspect: Option<Inspector>,
+    l7: Option<L7Check>,
 ) -> Result<RequestInfo, String> {
     let (head, mut leftover) = read_headers(client)?;
     let mut lines: Vec<String> = head.split("\r\n").map(|s| s.to_string()).collect();
@@ -356,6 +475,22 @@ fn relay_http<C: Read + Write, U: Read + Write>(
     let mut rl = request_line.split_whitespace();
     let method = rl.next().unwrap_or("").to_string();
     let path = rl.next().unwrap_or("").to_string();
+
+    // L7 method/path allowlist, checked before reading the body (cheap reject).
+    if let Some(check) = l7 {
+        if !check(&method, &path) {
+            write_error(
+                client,
+                "403 Forbidden (claude-island: L7 method/path denied)",
+            );
+            return Ok(RequestInfo {
+                method,
+                path,
+                body_len: 0,
+                preview: String::new(),
+            });
+        }
+    }
 
     // Strip Authorization ONLY when we will inject our own credential (a
     // credential host); otherwise pass the client's auth through unchanged
@@ -602,5 +737,78 @@ fn forward_chunked<C: Read, U: Write>(
         if buf.len() > 8 * 1024 * 1024 {
             return Err("chunked body too large".into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_star_does_not_cross_slash() {
+        assert!(glob_match(b"/repos/*", b"/repos/foo"));
+        assert!(!glob_match(b"/repos/*", b"/repos/foo/bar"));
+    }
+
+    #[test]
+    fn glob_doublestar_crosses_slash() {
+        assert!(glob_match(b"/repos/**", b"/repos/foo/bar/baz"));
+        assert!(glob_match(b"/repos/**", b"/repos/"));
+        assert!(!glob_match(b"/repos/**", b"/orgs/foo"));
+    }
+
+    #[test]
+    fn glob_middle_and_exact() {
+        assert!(glob_match(b"/repos/*/*/issues", b"/repos/a/b/issues"));
+        assert!(!glob_match(b"/repos/*/*/issues", b"/repos/a/b/pulls"));
+        assert!(glob_match(b"/user", b"/user"));
+        assert!(!glob_match(b"/user", b"/users"));
+    }
+
+    fn rules() -> L7Rules {
+        L7Rules::parse(
+            "# comment\n\
+             api.github.com GET /repos/**\n\
+             api.github.com POST /repos/*/*/issues\n\
+             api.github.com * /user\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn l7_allows_matching_method_and_path() {
+        let r = rules();
+        assert!(r.allows("api.github.com", "GET", "/repos/o/r/contents"));
+        assert!(r.allows("api.github.com", "POST", "/repos/o/r/issues"));
+        assert!(r.allows("api.github.com", "DELETE", "/user")); // method `*`
+    }
+
+    #[test]
+    fn l7_denies_unmatched_on_governed_host() {
+        let r = rules();
+        assert!(!r.allows("api.github.com", "DELETE", "/repos/o/r")); // wrong method for /repos/**? GET only
+        assert!(!r.allows("api.github.com", "GET", "/orgs/o")); // path not allowed
+        assert!(!r.allows("api.github.com", "POST", "/repos/o/r/pulls")); // path not allowed
+    }
+
+    #[test]
+    fn l7_ignores_query_string() {
+        let r = rules();
+        assert!(r.allows("api.github.com", "GET", "/repos/o/r?page=2"));
+    }
+
+    #[test]
+    fn l7_ungoverned_host_is_allowed() {
+        let r = rules();
+        assert!(r.allows("example.com", "DELETE", "/anything"));
+        assert!(!r.governs("example.com"));
+        assert!(r.governs("api.github.com"));
+    }
+
+    #[test]
+    fn l7_host_match_is_case_insensitive() {
+        let r = rules();
+        assert!(r.allows("API.GitHub.com", "GET", "/repos/x/y"));
+        assert!(!r.allows("API.GitHub.com", "DELETE", "/repos/x/y"));
     }
 }
