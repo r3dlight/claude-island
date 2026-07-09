@@ -229,6 +229,13 @@ pub fn run(
         // Start the next prompt if one is queued and none is on screen.
         if asking.is_none() {
             if let Some(req) = queue.pop_front() {
+                // Discard input typed before the prompt appeared (e.g. the
+                // Enter that submitted the request to the agent, or the
+                // keystroke that approved the agent's own tool prompt), so a
+                // stale byte cannot auto-answer this prompt.
+                unsafe {
+                    libc::tcflush(0, libc::TCIFLUSH);
+                }
                 let prompt = format!(
                     "\r\n\x1b[1;33m[claude-island]\x1b[0m allow network to {} ? [y/N] ",
                     req.domain
@@ -296,7 +303,13 @@ pub fn run(
                 Ok(k) => {
                     if let Some(req) = asking.take() {
                         let answer = buf[..k].iter().any(|&b| b == b'y' || b == b'Y');
-                        let echo = if answer { "yes\r\n" } else { "no\r\n" };
+                        // Leave a visible, colored confirmation line so the
+                        // decision is not erased by the agent's next redraw.
+                        let echo = if answer {
+                            format!("\x1b[1;32m-> allowed {}\x1b[0m\r\n", req.domain)
+                        } else {
+                            format!("\x1b[1;31m-> denied {}\x1b[0m\r\n", req.domain)
+                        };
                         let _ = stdout.write_all(echo.as_bytes());
                         let _ = req.reply.send(answer);
                         // Flush any output that arrived during the prompt.
