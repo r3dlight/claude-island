@@ -382,10 +382,10 @@ impl Broker {
             return true;
         };
         let gz = if leak.compressed { ", gzip" } else { "" };
-        let what = if leak.kind == "honeytoken" {
-            format!("honeytoken {:?}{gz}", leak.detail)
-        } else {
-            format!("code from {} ({} fragments{gz})", leak.detail, leak.score)
+        let what = match leak.kind {
+            "honeytoken" => format!("honeytoken {:?}{gz}", leak.detail),
+            "secret" => format!("{}{gz}", leak.detail),
+            _ => format!("code from {} ({} fragments{gz})", leak.detail, leak.score),
         };
         // With an inline prompter (--ask), let the user decide per leak;
         // otherwise fail safe and block. Default (timeout/no answer) is block.
@@ -532,13 +532,15 @@ fn relay_http<C: Read + Write, U: Read + Write>(
 
     if let (Some(check), Some(body)) = (inspect, &buffered) {
         if !check(body) {
-            // Blocked: tell the client and never touch the real host.
+            // Blocked: tell the client and never touch the real host. The body
+            // preview is withheld from the audit here - it is the leaking
+            // content (possibly a secret) and must not be written to the log.
             write_error(client, "403 Forbidden (claude-island: leak blocked)");
             return Ok(RequestInfo {
                 method,
                 path,
                 body_len,
-                preview,
+                preview: "[withheld: blocked leak]".to_string(),
             });
         }
     }

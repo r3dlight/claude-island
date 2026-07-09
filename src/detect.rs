@@ -46,15 +46,18 @@ const MAX_FILE: u64 = 1_000_000;
 pub struct Detector {
     /// fingerprint -> a representative file that contains it.
     fps: HashMap<u64, String>,
+    /// file -> its number of distinct fingerprints (for the adaptive threshold
+    /// so a small file, which yields few fingerprints, is still catchable).
+    file_fps: HashMap<String, usize>,
     honeytokens: Vec<String>,
     pub files: usize,
 }
 
 /// A detected leak in an outbound body.
 pub struct Leak {
-    pub kind: &'static str, // "honeytoken" | "code"
-    pub detail: String,     // the token, or the matched file
-    pub score: usize,       // matched fingerprints (0 for honeytoken)
+    pub kind: &'static str, // "honeytoken" | "secret" | "code"
+    pub detail: String,     // the token, the secret type, or the matched file
+    pub score: usize,       // matched fingerprints (0 for honeytoken/secret)
     pub compressed: bool,   // the body was gzip/zlib compressed
 }
 
@@ -109,18 +112,69 @@ fn looks_binary(data: &[u8]) -> bool {
     data.iter().take(8192).any(|&b| b == 0)
 }
 
+/// Well-known secret formats: (type name, prefix, minimum run of following
+/// token characters). The prefixes are distinctive enough to keep false
+/// positives near zero. Used to catch credentials leaving the sandbox even
+/// when they are not part of the project's own files.
+const SECRET_RULES: &[(&str, &str, usize)] = &[
+    ("AWS access key", "AKIA", 16),
+    ("AWS access key", "ASIA", 16),
+    ("GitHub token", "ghp_", 30),
+    ("GitHub token", "gho_", 30),
+    ("GitHub token", "ghs_", 30),
+    ("GitHub token", "ghu_", 30),
+    ("GitHub token", "ghr_", 30),
+    ("GitHub token", "github_pat_", 20),
+    ("Google API key", "AIza", 30),
+    ("Stripe key", "sk_live_", 20),
+    ("Stripe key", "rk_live_", 20),
+    ("Slack token", "xoxb-", 10),
+    ("Slack token", "xoxp-", 10),
+    ("Slack token", "xoxa-", 10),
+    ("Slack token", "xoxr-", 10),
+    ("OpenAI key", "sk-proj-", 20),
+];
+
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Scans for a well-known secret format. Returns the secret TYPE only, never
+/// the secret value itself (which must never be logged). Also catches PEM
+/// private keys.
+fn scan_secrets(text: &str) -> Option<&'static str> {
+    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
+        return Some("private key");
+    }
+    let bytes = text.as_bytes();
+    for (name, prefix, min_len) in SECRET_RULES {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(prefix) {
+            let start = from + rel + prefix.len();
+            let run = bytes[start..]
+                .iter()
+                .take_while(|b| is_token_char(**b))
+                .count();
+            if run >= *min_len {
+                return Some(name);
+            }
+            from = start; // advance past this occurrence and keep looking
+        }
+    }
+    None
+}
+
 impl Detector {
-    /// Indexes the project and loads honeytokens. Returns None if there is
-    /// nothing to detect (no indexable files and no honeytokens).
+    /// Indexes the project and loads honeytokens. Always returns a detector:
+    /// known-secret scanning works even with no project files or honeytokens.
     pub fn index(project: &Path, honeytokens: Vec<String>) -> Option<Detector> {
         let mut fps = HashMap::new();
+        let mut file_fps = HashMap::new();
         let mut files = 0usize;
-        index_dir(project, project, &mut fps, &mut files);
-        if fps.is_empty() && honeytokens.is_empty() {
-            return None;
-        }
+        index_dir(project, project, &mut fps, &mut file_fps, &mut files);
         Some(Detector {
             fps,
+            file_fps,
             honeytokens,
             files,
         })
@@ -128,27 +182,38 @@ impl Detector {
 
     /// Scans an outbound body. Returns the strongest leak signal, if any.
     /// A gzip/zlib body is transparently decompressed first, so compressed
-    /// exfiltration is caught too.
+    /// exfiltration is caught too. Order: honeytokens, known secrets, project
+    /// code (with a per-file adaptive threshold).
     pub fn scan(&self, body: &[u8]) -> Option<Leak> {
         let decompressed = maybe_decompress(body);
         let compressed = decompressed.is_some();
         let data = decompressed.as_deref().unwrap_or(body);
+        let text = String::from_utf8_lossy(data);
 
-        // Honeytokens first (exact, high confidence).
-        if !self.honeytokens.is_empty() {
-            let text = String::from_utf8_lossy(data);
-            for t in &self.honeytokens {
-                if !t.is_empty() && text.contains(t.as_str()) {
-                    return Some(Leak {
-                        kind: "honeytoken",
-                        detail: t.clone(),
-                        score: 0,
-                        compressed,
-                    });
-                }
+        // Honeytokens (exact, high confidence).
+        for t in &self.honeytokens {
+            if !t.is_empty() && text.contains(t.as_str()) {
+                return Some(Leak {
+                    kind: "honeytoken",
+                    detail: t.clone(),
+                    score: 0,
+                    compressed,
+                });
             }
         }
-        // Fingerprint overlap, tallied per source file.
+        // Well-known secret formats (AWS/GitHub/Google/Stripe/Slack, PEM keys).
+        if let Some(kind) = scan_secrets(&text) {
+            return Some(Leak {
+                kind: "secret",
+                detail: kind.to_string(),
+                score: 0,
+                compressed,
+            });
+        }
+        // Project code: fingerprint overlap tallied per file. The threshold is
+        // adaptive - a file that yields few fingerprints (a short file) needs
+        // proportionally fewer matches, so a full copy of it is still caught,
+        // while an accidental overlap with a large file still needs THRESHOLD.
         let mut per_file: HashMap<&str, usize> = HashMap::new();
         for h in fingerprints(data) {
             if let Some(file) = self.fps.get(&h) {
@@ -157,8 +222,11 @@ impl Detector {
         }
         per_file
             .into_iter()
+            .filter(|(file, n)| {
+                let total = self.file_fps.get(*file).copied().unwrap_or(THRESHOLD);
+                *n >= total.clamp(2, THRESHOLD)
+            })
             .max_by_key(|(_, n)| *n)
-            .filter(|(_, n)| *n >= THRESHOLD)
             .map(|(file, n)| Leak {
                 kind: "code",
                 detail: file.to_string(),
@@ -168,7 +236,13 @@ impl Detector {
     }
 }
 
-fn index_dir(root: &Path, dir: &Path, fps: &mut HashMap<u64, String>, files: &mut usize) {
+fn index_dir(
+    root: &Path,
+    dir: &Path,
+    fps: &mut HashMap<u64, String>,
+    file_fps: &mut HashMap<String, usize>,
+    files: &mut usize,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -180,7 +254,7 @@ fn index_dir(root: &Path, dir: &Path, fps: &mut HashMap<u64, String>, files: &mu
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            index_dir(root, &path, fps, files);
+            index_dir(root, &path, fps, file_fps, files);
         } else if ft.is_file() {
             if entry.metadata().map(|m| m.len() > MAX_FILE).unwrap_or(true) {
                 continue;
@@ -196,14 +270,16 @@ fn index_dir(root: &Path, dir: &Path, fps: &mut HashMap<u64, String>, files: &mu
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            let mut added = false;
-            for h in fingerprints(&data) {
+            let distinct: std::collections::HashSet<u64> =
+                fingerprints(&data).into_iter().collect();
+            if distinct.is_empty() {
+                continue;
+            }
+            file_fps.insert(rel.clone(), distinct.len());
+            for h in distinct {
                 fps.entry(h).or_insert_with(|| rel.clone());
-                added = true;
             }
-            if added {
-                *files += 1;
-            }
+            *files += 1;
         }
     }
 }
@@ -238,11 +314,17 @@ mod tests {
     /// A detector holding one indexed "file" and the given honeytokens.
     fn detector(content: &str, honeytokens: Vec<String>) -> Detector {
         let mut fps = HashMap::new();
-        for h in fingerprints(content.as_bytes()) {
+        let distinct: std::collections::HashSet<u64> =
+            fingerprints(content.as_bytes()).into_iter().collect();
+        let count = distinct.len();
+        for h in distinct {
             fps.entry(h).or_insert_with(|| "src/x.rs".to_string());
         }
+        let mut file_fps = HashMap::new();
+        file_fps.insert("src/x.rs".to_string(), count);
         Detector {
             fps,
+            file_fps,
             honeytokens,
             files: 1,
         }
@@ -353,5 +435,77 @@ mod tests {
         assert_eq!(leak.detail, "src/a.rs");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Test secrets are assembled from fragments via `concat!` so no full secret
+    // pattern ever appears as a literal in this source file, which would trip
+    // GitHub push protection / secret scanners. The runtime value is complete,
+    // so the detector still sees a real match.
+    const AWS_KEY: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
+
+    #[test]
+    fn scan_detects_known_secrets() {
+        let d = detector(CODE, vec![]);
+        let cases: [(&str, &str); 5] = [
+            (AWS_KEY, "AWS access key"),
+            (
+                concat!("ghp_", "012345678901234567890123456789012345"),
+                "GitHub token",
+            ),
+            (
+                concat!("AIza", "SyA0000000000000000000000000000000000"),
+                "Google API key",
+            ),
+            (
+                concat!("sk_", "live_", "0123456789abcdefghijklmn"),
+                "Stripe key",
+            ),
+            (
+                concat!("-----BEGIN ", "OPENSSH PRIVATE ", "KEY-----\nabc\n-----END"),
+                "private key",
+            ),
+        ];
+        for (secret, want) in cases {
+            let body = format!("prefix {secret} suffix");
+            let leak = d.scan(body.as_bytes()).expect("secret must be detected");
+            assert_eq!(leak.kind, "secret");
+            assert_eq!(leak.detail, want, "case: {want}");
+        }
+    }
+
+    #[test]
+    fn scan_secrets_no_false_positive_on_benign() {
+        let d = detector(CODE, vec![]);
+        // Prefixes present but the trailing run is too short to qualify.
+        assert!(scan_secrets(concat!("ghp_", "short and ", "AKIA", "tooshort")).is_none());
+        assert!(d.scan(BENIGN.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn scan_secret_survives_gzip() {
+        let d = detector(CODE, vec![]);
+        let body = format!("key {AWS_KEY} tail");
+        let leak = d
+            .scan(&gzip(body.as_bytes()))
+            .expect("gzipped secret detected");
+        assert_eq!(leak.kind, "secret");
+        assert!(leak.compressed);
+    }
+
+    #[test]
+    fn adaptive_threshold_catches_small_file() {
+        // A short file yields fewer than THRESHOLD fingerprints; a full copy of
+        // it must still be detected thanks to the per-file adaptive threshold.
+        let small = "fn tiny_unique_marker_42() -> u64 { 0xFEEDFACE }";
+        let d = detector(small, vec![]);
+        let fp = fingerprints(small.as_bytes()).len();
+        assert!(
+            fp < THRESHOLD,
+            "test needs a small file (<{THRESHOLD} fp), got {fp}"
+        );
+        let leak = d
+            .scan(small.as_bytes())
+            .expect("small file leak must be caught");
+        assert_eq!(leak.kind, "code");
     }
 }

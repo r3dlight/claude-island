@@ -368,13 +368,22 @@ host; if a chunk of your local code (or a honeytoken) appears, the request is
 [1783590111] !!! LEAK BLOCKED: code from src/algo.rs (6 fragments) -> example.com (body 82B)
 ```
 
+It also blocks **known secret formats** leaving to a non-Anthropic host, even
+when they are not part of the project's files: AWS access keys, GitHub tokens,
+Google/Stripe/Slack keys, OpenAI keys and PEM private keys. Only the secret
+*type* is ever written to the log, never its value (and a blocked body's
+preview is withheld too), so the audit log never becomes a place secrets leak.
+
 The Anthropic API is audited but never flagged: it legitimately carries your
 code (that is how Claude Code works), so alarming on it would be noise. The
-signal is code leaving to **anywhere else**. gzip- and zlib-compressed bodies
-are transparently decompressed before scanning, so compressed exfiltration is
-caught too. Bodies larger than 8 MB stream unscanned (source files are small,
-so this misses little), and detection stays heuristic: a bespoke encoding or
-encryption applied before sending can still evade the fingerprints.
+signal is code (or a secret) leaving to **anywhere else**. gzip- and
+zlib-compressed bodies are transparently decompressed before scanning, so
+compressed exfiltration is caught too. The code threshold is adaptive to file
+size, so a full copy of even a short file is caught, while accidental overlap
+with a large file still needs several matching fragments. Bodies larger than
+8 MB stream unscanned (source files are small, so this misses little), and
+detection stays heuristic: a bespoke encoding or encryption applied before
+sending can still evade the fingerprints.
 
 Combine with `--ask` (in a terminal) to decide **per leak** instead of
 blocking outright: a red inline prompt shows what is leaving and where, and
