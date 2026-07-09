@@ -91,10 +91,23 @@ allowlisted one must pass).
 
 ## Install
 
-Requirements: Linux kernel 6.12+ (Landlock ABI 6), Rust 1.89+.
+Requirements: Linux kernel 6.12+ (Landlock ABI 6), Rust (`cargo`, for the
+Island backend which has no prebuilt binaries).
+
+One line:
 
 ```sh
-./install.sh    # cargo-installs Island, builds claude-island into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/r3dlight/claude-island/main/install.sh | sh
+```
+
+It installs Island (at the pinned revision) and `claude-island` into
+`~/.local/bin`: the prebuilt release binary on Linux x86_64, else built from
+source. Set `CLAUDE_ISLAND_PREFIX` to install elsewhere.
+
+From a checkout instead (for development), the same script builds from source:
+
+```sh
+./install.sh
 ```
 
 The script also copies `~/.claude.json` into `~/.claude/` (the sandbox runs
