@@ -55,7 +55,7 @@ Claude and every process it spawns get:
 | Files | current project (rw), Claude state and caches, system dirs (read/exec) | everything else: `~/.ssh`, `~/.aws`, `~/.config/gh`, dotfiles, other projects, `$HOME` itself |
 | Network | outbound TCP 443/80/53 (only the proxy port with `--proxy`) | listening, unless `--serve`/`--ports` |
 | Local services | | D-Bus, Wayland and ssh-agent sockets, abstract sockets, signals to the outside |
-| Resources | 8G RAM, 4096 tasks (systemd limits) | fork bombs, runaway builds |
+| Resources | 8G RAM, 4096 tasks (systemd limits, tune with `--mem`/`--tasks`) | fork bombs, runaway builds |
 
 Secrets are also scrubbed from the environment before launch: a fixed list
 (`SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `AWS_*`, ...) plus every
@@ -148,11 +148,14 @@ claude-island allow                 approve the project's .claude-island.toml
 claude-island --list                list available environments
 claude-island --serve               allow TCP bind on 3000, 4321, 5173, 8000, 8080
 claude-island --ports 9000,9443     additional bind ports
+claude-island --mem 4G --tasks 2048 session resource limits (memory, processes)
 claude-island --dry-run             show the generated profile and command
 claude-island -- --resume           everything after -- is passed to claude
 ```
 
-Tuning: `CLAUDE_ISLAND_MEM` (default 8G), `CLAUDE_ISLAND_TASKS` (default 4096).
+Resource limits: `--mem` / `--tasks` (or the `CLAUDE_ISLAND_MEM` /
+`CLAUDE_ISLAND_TASKS` env vars; defaults 8G / 4096) apply via `systemd-run`
+in every mode, including `--ask`.
 
 ### Per-project config: `.claude-island.toml`
 

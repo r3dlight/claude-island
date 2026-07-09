@@ -116,6 +116,8 @@ Options:
   --allow DOMAIN   add a domain to the proxy allowlist (repeatable)
   --serve          allow TCP bind on 3000, 4321, 5173, 8000, 8080
   --ports P1,P2    additional bind ports
+  --mem SIZE       memory limit for the session (default 8G; systemd MemoryMax)
+  --tasks N        max processes/threads (default 4096; systemd TasksMax)
   --dry-run        generate the profile and print the command without running
   --json           machine-readable JSONL output (denials only)
   --list           list environments and aliases
@@ -142,6 +144,8 @@ struct Opts {
     allow: Vec<String>,
     dry_run: bool,
     json: bool,
+    mem: Option<String>,
+    tasks: Option<String>,
     rest: Vec<String>,
 }
 
@@ -189,6 +193,14 @@ fn parse(args: &[String], registry: &[envs::EnvSpec]) -> Result<Parsed> {
                 i += 1;
                 let v = args.get(i).ok_or("--allow expects a domain")?;
                 o.allow.push(v.clone());
+            }
+            "--mem" => {
+                i += 1;
+                o.mem = Some(args.get(i).ok_or("--mem expects a value, e.g. 8G")?.clone());
+            }
+            "--tasks" => {
+                i += 1;
+                o.tasks = Some(args.get(i).ok_or("--tasks expects a number")?.clone());
             }
             "--deny" => {
                 i += 1;
@@ -580,6 +592,16 @@ fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         o.deny = candidates;
     }
 
+    // 5. Resource limits.
+    let mem = prompt_line("\nmemory limit [8G]: ")?;
+    if !mem.is_empty() {
+        o.mem = Some(mem);
+    }
+    let tasks = prompt_line("max processes/threads [4096]: ")?;
+    if !tasks.is_empty() {
+        o.tasks = Some(tasks);
+    }
+
     // Summary and confirm.
     let mut feats: Vec<String> = vec![];
     if o.auto {
@@ -596,6 +618,12 @@ fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     }
     for d in &o.deny {
         feats.push(format!("--deny {d}"));
+    }
+    if let Some(m) = &o.mem {
+        feats.push(format!("--mem {m}"));
+    }
+    if let Some(t) = &o.tasks {
+        feats.push(format!("--tasks {t}"));
     }
     println!(
         "\nlaunching: claude-island {}",
@@ -645,17 +673,11 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     )
     .map_err(|e| format!("profile generation: {e}"))?;
 
-    // The sandboxed program (CLAUDE_ISLAND_EXEC overrides "claude", handy for
-    // testing the overlay with e.g. bash). In the PTY path we must own the
-    // controlling terminal, so systemd-run (resource limits) is skipped there
-    // to keep the ctty setup deterministic; the normal path keeps it.
-    let program = env::var("CLAUDE_ISLAND_EXEC").unwrap_or_else(|_| "claude".into());
-    let island_argv: Vec<String> = ["island", "run", "-p", &prof.name, "--"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain(std::iter::once(program))
-        .chain(o.rest.iter().cloned())
-        .collect();
+    // The full launch command: systemd-run resource limits (if available)
+    // wrapping `island run -- claude`. systemd-run preserves the controlling
+    // terminal, so this same argv is used by both the normal and PTY paths.
+    let (mem, tasks) = resource_limits(&o);
+    let argv = launch_argv(&prof.name, &o.rest, &mem, &tasks);
 
     if o.dry_run {
         println!("generated profile: {}", prof.dir.display());
@@ -665,10 +687,10 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
             SCRUB_SUFFIXES.join(", *"),
             KEEP_ENV.join(", ")
         );
-        if use_pty {
-            println!("mode: inline PTY (no systemd-run resource limits)");
+        if envs::has_cmd("systemd-run") {
+            println!("limits: MemoryMax={mem}, TasksMax={tasks}");
         }
-        println!("command: {}", island_argv.join(" "));
+        println!("command: {}", argv.join(" "));
         return Ok(ExitCode::SUCCESS);
     }
     if !envs::has_cmd("island") {
@@ -683,26 +705,8 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
     if let Some((_, rx, wake_r)) = pump {
         // Inline PTY path: wrap the command and pump I/O + approval prompts.
-        return pty::run(&island_argv, scrub_env, rx, wake_r)
-            .map_err(|e| format!("pty overlay: {e}"));
+        return pty::run(&argv, scrub_env, rx, wake_r).map_err(|e| format!("pty overlay: {e}"));
     }
-
-    // Normal path: optional systemd-run resource limits, then exec.
-    let mut argv: Vec<String> = vec![];
-    if envs::has_cmd("systemd-run") {
-        argv.extend(
-            ["systemd-run", "--user", "--scope", "--quiet", "--same-dir"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-        let mem = env::var("CLAUDE_ISLAND_MEM").unwrap_or_else(|_| "8G".into());
-        let tasks = env::var("CLAUDE_ISLAND_TASKS").unwrap_or_else(|_| "4096".into());
-        argv.push("-p".into());
-        argv.push(format!("MemoryMax={mem}"));
-        argv.push("-p".into());
-        argv.push(format!("TasksMax={tasks}"));
-    }
-    argv.extend(island_argv);
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
@@ -711,6 +715,46 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
         .status()
         .map_err(|e| format!("failed to run {}: {e}", argv[0]))?;
     Ok(exit_code(status))
+}
+
+/// Effective resource limits: --mem/--tasks flags, else the CLAUDE_ISLAND_MEM
+/// / CLAUDE_ISLAND_TASKS env vars, else the defaults.
+fn resource_limits(o: &Opts) -> (String, String) {
+    let mem = o
+        .mem
+        .clone()
+        .or_else(|| env::var("CLAUDE_ISLAND_MEM").ok())
+        .unwrap_or_else(|| "8G".into());
+    let tasks = o
+        .tasks
+        .clone()
+        .or_else(|| env::var("CLAUDE_ISLAND_TASKS").ok())
+        .unwrap_or_else(|| "4096".into());
+    (mem, tasks)
+}
+
+/// Builds `[systemd-run ... island run -p <prof> -- <program> <rest>]`.
+/// systemd-run (with MemoryMax/TasksMax) is prepended when available; it
+/// preserves the controlling terminal so the PTY path works too.
+/// CLAUDE_ISLAND_EXEC overrides "claude" (handy for testing with e.g. bash).
+fn launch_argv(prof_name: &str, rest: &[String], mem: &str, tasks: &str) -> Vec<String> {
+    let mut argv: Vec<String> = vec![];
+    if envs::has_cmd("systemd-run") {
+        argv.extend(
+            ["systemd-run", "--user", "--scope", "--quiet", "--same-dir"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        argv.push("-p".into());
+        argv.push(format!("MemoryMax={mem}"));
+        argv.push("-p".into());
+        argv.push(format!("TasksMax={tasks}"));
+    }
+    let program = env::var("CLAUDE_ISLAND_EXEC").unwrap_or_else(|_| "claude".into());
+    argv.extend(["island", "run", "-p", prof_name, "--"].iter().map(|s| s.to_string()));
+    argv.push(program);
+    argv.extend(rest.iter().cloned());
+    argv
 }
 
 fn cmd_check(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
