@@ -1038,7 +1038,10 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
 
     if let Some((_, rx, wake_r)) = pump {
         // Inline PTY path: wrap the command and pump I/O + approval prompts.
-        return pty::run(&argv, scrub_env, rx, wake_r).map_err(|e| format!("pty overlay: {e}"));
+        let code =
+            pty::run(&argv, scrub_env, rx, wake_r).map_err(|e| format!("pty overlay: {e}"))?;
+        session_summary(&o, &home);
+        return Ok(code);
     }
 
     let mut cmd = Command::new(&argv[0]);
@@ -1047,7 +1050,24 @@ fn cmd_run(o: Opts, registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     let status = cmd
         .status()
         .map_err(|e| format!("failed to run {}: {e}", argv[0]))?;
+    session_summary(&o, &home);
     Ok(exit_code(status))
+}
+
+/// After a `--detect`/`--l7` session ends, print a summary of what tried to
+/// leave the sandbox (reassuring when nothing did, actionable when something
+/// was blocked). The audit file is unbuffered, so completed events are on disk.
+fn session_summary(o: &Opts, home: &std::path::Path) {
+    if !(o.detect || o.l7) {
+        return;
+    }
+    let path = home.join(".cache/claude-island/outbound-audit.log");
+    let Ok(log) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let r = report::parse(&log, true);
+    eprintln!();
+    eprint!("{}", report::render(&r, "this session"));
 }
 
 /// Effective resource limits: --mem/--tasks flags, else the CLAUDE_ISLAND_MEM

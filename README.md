@@ -414,7 +414,10 @@ claude-island session report (last session)
     BLOCKED  code from src/algo.rs     -> pastebin.com  x3
 ```
 
-`--all` covers every session in the log instead of only the last one.
+`--all` covers every session in the log instead of only the last one. Under
+`--detect` or `--l7` this same summary is printed automatically when the
+session ends, so you always see what tried to leave (and are reassured when
+nothing did).
 
 ### Method/path allowlist: `--l7`
 
