@@ -7,8 +7,9 @@
 Run [Claude Code](https://claude.com/claude-code) inside a kernel-enforced
 sandbox. Claude can work on the current project and nothing else: your SSH
 keys, tokens, dotfiles and other projects are invisible, and the network can
-be reduced to an allowlist of domains. Built on
-[Island](https://github.com/landlock-lsm/island) and
+be reduced to an allowlist of domains. You can also inspect everything that
+leaves the sandbox and block your local code from being sent anywhere
+unexpected. Built on [Island](https://github.com/landlock-lsm/island) and
 [Landlock](https://landlock.io).
 
 ## Quickstart
@@ -111,17 +112,20 @@ enable them? [Y/n]
 network:
   [1] normal (outbound 443/80/53 to any host)
   [2] filter and ask before each new domain (--ask)
-choice [1]: 2
+  [3] filter + ask + detect and block code leaks (--ask --detect)
+choice [1]: 3
+let gh/git reach GitHub with your token (brokered, never enters the sandbox)? [y/N] y
 read-only project (code review)? [y/N]
 hide .git, .env from the agent (contents unreadable)? [y/N] y
-launching: claude-island --auto --ask --deny .git --deny .env
+launching: claude-island --auto --ask --broker --detect --deny .git --deny .env
 proceed? [Y/n]
 ```
 
 It auto-detects the project's environments and offers the common toggles
-(network filtering, read-only, hiding secrets found at the project root).
-Passing any flag skips it; so does a non-interactive context (piped, cron).
-Set `CLAUDE_ISLAND_NO_WIZARD=1` to always skip it.
+(network filtering, leak detection, the GitHub broker when a token is present,
+read-only, hiding secrets found at the project root). Passing any flag skips
+it; so does a non-interactive context (piped, cron). Set
+`CLAUDE_ISLAND_NO_WIZARD=1` to always skip it.
 
 ## Everyday usage
 
@@ -138,6 +142,9 @@ claude-island --deny .git --deny .env  protect top-level entries from the agent
 claude-island --proxy               network filtered by domain allowlist
 claude-island --ask                 prompt to approve each new domain (inline)
 claude-island --allow foo.dev       add a domain to the allowlist (repeatable)
+claude-island --broker              gh/git/curl reach GitHub without the token entering the sandbox
+claude-island --inspect             log every outbound request (plaintext) for review
+claude-island --detect              block local code from leaving to non-Anthropic hosts
 claude-island denials -- cargo build  run a command, report every access it was denied
 claude-island check                 canary suite: verify the sandbox holds
 claude-island check --ro            same, read-only variant
@@ -248,9 +255,11 @@ gitlab.example.com          # a domain also covers its subdomains
 Denials and grants are logged to `~/.cache/claude-island/proxy.log`: check
 it to see what Claude actually tried to reach, and refine the list. That log
 is also the session trace of which domains were contacted and which were
-approved (`APPROVED (inline)` / `DENIED (inline)` lines). Because the proxy
-is a CONNECT tunnel, it sees hosts, ports and timing, not the encrypted
-payload (content inspection would need TLS termination, which we do not do).
+approved (`APPROVED (inline)` / `DENIED (inline)` lines). By default the proxy
+is a plain CONNECT tunnel: it sees hosts, ports and timing, not the encrypted
+payload. Opt-in TLS termination, for credential injection and content
+inspection, is available through `--broker`, `--inspect` and `--detect`
+(below).
 
 ### Interactive approval: `--ask`
 
@@ -261,7 +270,7 @@ silently denying it. It adapts to the environment:
   prompts inline, exactly like Claude Code's own permission prompts:
 
   ```
-  [claude-island] allow network to api.example.dev ? [y/N]
+  ▌ claude-island  allow network to api.example.dev ?  [y/N]
   ```
 
   The connection pauses until you answer; `y` (a single keystroke) approves
@@ -376,6 +385,10 @@ the request is held until you answer (default, and on timeout, is to block):
 
 Without a terminal (or without `--ask`), a detected leak is blocked
 automatically and recorded as `!!! LEAK BLOCKED` in the audit log.
+
+Test it end to end with `scripts/test-detect.sh` (it exercises plain,
+gzipped, honeytoken and benign cases and checks each verdict), or ask Claude
+to `curl` a project file to an allowlisted test host and watch it get blocked.
 
 ## Code review mode: `--ro` and `--noexec`
 
@@ -546,7 +559,8 @@ Design notes:
 
 * Without `--proxy`, any host is reachable on 443. With it, exfiltration is
   still possible towards the allowlisted domains themselves: keep the list
-  minimal.
+  minimal, and use `--detect` to block local code (or honeytokens) from
+  leaving to any non-Anthropic host.
 * UDP is not covered by Landlock (QUIC/HTTP-3 passes), except with
   `--proxy` where only the proxy's TCP port is reachable.
 * File metadata (stat) is not restricted; file contents are.

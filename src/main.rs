@@ -832,9 +832,34 @@ fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     println!("\nnetwork:");
     println!("  [1] normal (outbound 443/80/53 to any host)");
     println!("  [2] filter and ask before each new domain (--ask)");
+    println!("  [3] filter + ask + detect and block code leaks (--ask --detect)");
     let net = prompt_line("choice [1]: ")?;
-    if net == "2" {
-        o.ask = true;
+    match net.as_str() {
+        "2" => {
+            o.ask = true;
+            o.proxy = true;
+        }
+        "3" => {
+            o.ask = true;
+            o.proxy = true;
+            o.inspect = true;
+            o.detect = true;
+        }
+        _ => {}
+    }
+
+    // 2b. Credential broker, only when a GitHub token is available to broker.
+    let has_gh = env::var("GITHUB_TOKEN")
+        .ok()
+        .or_else(|| env::var("GH_TOKEN").ok())
+        .is_some_and(|t| !t.trim().is_empty());
+    if has_gh
+        && ask_yesno(
+            "let gh/git reach GitHub with your token (brokered, never enters the sandbox)?",
+            false,
+        )?
+    {
+        o.broker = true;
         o.proxy = true;
     }
 
@@ -881,6 +906,14 @@ fn cmd_wizard(registry: &[envs::EnvSpec]) -> Result<ExitCode> {
     }
     if o.ask {
         feats.push("--ask".into());
+    }
+    if o.broker {
+        feats.push("--broker".into());
+    }
+    if o.detect {
+        feats.push("--detect".into());
+    } else if o.inspect {
+        feats.push("--inspect".into());
     }
     if o.ro {
         feats.push("--ro".into());
@@ -1498,7 +1531,7 @@ fn cmd_watch() -> Result<ExitCode> {
             if handled.contains(&d) {
                 continue;
             }
-            print!("blocked: {d}  — approve? [y]es / [n]o / [q]uit: ");
+            print!("blocked: {d}  approve? [y]es / [n]o / [q]uit: ");
             std::io::stdout().flush().ok();
             let mut line = String::new();
             if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
