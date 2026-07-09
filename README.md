@@ -17,6 +17,15 @@ be reduced to an allowlist of domains. Built on
 ./install.sh                # builds Island and claude-island, checks the kernel
 
 cd ~/dev/my-project
+claude-island               # no args: interactive setup, then launches
+```
+
+With no arguments, claude-island asks the essentials (environments, network,
+read-only, hiding secrets) and launches with your choices. Or drive it
+directly with flags:
+
+```sh
+cd ~/dev/my-project
 claude-island check         # prove the sandbox holds before trusting it
 claude-island --rust        # sandboxed Claude Code, with your Rust toolchain
 ```
